@@ -137,6 +137,13 @@ class FIREvLLMRollout(vLLMRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+        if prompts.meta_info.get('val_temperature', None):
+            kwargs['temperature'] = prompts.meta_info['val_temperature']
+
+        # supporting adding any sampling params from meta_info 
+        for k in prompts.meta_info.keys():
+            if hasattr(SamplingParams(), str(k)):
+                kwargs[k] = prompts.meta_info[k]
 
         if not self.use_fire_sampling:
             # users can customize different sampling_params at different run

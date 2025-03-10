@@ -24,11 +24,14 @@ import pandas as pd
 import numpy as np
 
 
+from deepscaler.rewards.math_reward import deepscaler_reward_fn
+
+
 def select_reward_fn(data_source):
     if data_source == 'lighteval/MATH':
         return math.compute_score
     else:
-        raise NotImplementedError
+        return deepscaler_reward_fn
 
 
 @hydra.main(config_path='config', config_name='evaluation', version_base=None)

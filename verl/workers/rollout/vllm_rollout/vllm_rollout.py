@@ -185,6 +185,14 @@ class vLLMRollout(BaseRollout):
                 'n': 1  # if greedy, only 1 response
             }
 
+        if prompts.meta_info.get('val_temperature', None):
+            kwargs['temperature'] = prompts.meta_info['val_temperature']
+
+        # supporting adding any sampling params from meta_info 
+        for k in prompts.meta_info.keys():
+            if hasattr(SamplingParams(), str(k)):
+                kwargs[k] = prompts.meta_info[k]
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             output = self.inference_engine.generate(
