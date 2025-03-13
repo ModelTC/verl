@@ -13,6 +13,9 @@ data:
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You should disable this and set `truncation='left'
   truncation: error
   image_key: images
+  use_partial_rollout: False
+  max_response_length_in_partial: 512
+  train_num_threshold: 0.8
 
 actor_rollout_ref:
   hybrid_engine: True

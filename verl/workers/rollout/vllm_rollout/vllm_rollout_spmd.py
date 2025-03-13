@@ -216,22 +216,26 @@ class vLLMRollout(BaseRollout):
         # TODO(sgm): disable logprob when recompute_log_prob is enable
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
+        pad_response_length = prompts.meta_info.get('max_tokens', self.config.response_length)
+
         response = []
         for output in outputs:
             for sample_id in range(len(output.outputs)):
                 response.append(output.outputs[sample_id].token_ids)
 
         response = pad_2d_list_to_length(response, self.pad_token_id,
-                                         max_length=self.config.response_length).to(idx.device)
+                                         max_length=pad_response_length).to(idx.device)
 
-        if self.config.n > 1 and do_sample:
-            idx = _repeat_interleave(idx, self.config.n)
-            attention_mask = _repeat_interleave(attention_mask, self.config.n)
-            position_ids = _repeat_interleave(position_ids, self.config.n)
-            batch_size = batch_size * self.config.n
+        # if self.config.n > 1 and do_sample:
+        n = prompts.meta_info.get('n', self.config.n)
+        if n > 1 and do_sample:
+            idx = _repeat_interleave(idx, n)
+            attention_mask = _repeat_interleave(attention_mask, n)
+            position_ids = _repeat_interleave(position_ids, n)
+            batch_size = batch_size * n
             if 'multi_modal_inputs' in non_tensor_batch.keys():
                 non_tensor_batch['multi_modal_inputs'] = _repeat_interleave(non_tensor_batch['multi_modal_inputs'],
-                                                                            self.config.n)
+                                                                            n)
 
         seq = torch.cat([idx, response], dim=-1)
 

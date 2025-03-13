@@ -30,7 +30,7 @@ import numpy as np
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -39,11 +39,20 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+
 WorkerType = Type[Worker]
 
+def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
+    """Convert a DataProtoItem to a DataProto object"""
+    return DataProto.from_dict(
+        tensors=item.batch,  # TensorDict is already in correct format
+        non_tensors=item.non_tensor_batch,  # Dict is already in correct format 
+        meta_info=item.meta_info
+    )
 
 class Role(Enum):
     """
@@ -386,6 +395,39 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] = timer.last
 
 
+def compute_generate_data_metrics(gen_batch):
+    response_info = _compute_response_info(gen_batch)
+    prompt_length = response_info['prompt_length']
+    response_length = response_info['response_length']
+    metrics = {
+        # prompt length
+        'gen_batch/prompt_length/sum':
+            torch.sum(prompt_length).detach().item(),
+        'gen_batch/prompt_length/max':
+            torch.max(prompt_length).detach().item(),
+        'gen_batch/prompt_length/mean':
+            torch.mean(prompt_length).detach().item(),
+
+        # response length
+        'gen_batch/response_length/sum':
+            torch.sum(response_length).detach().item(),
+        'gen_batch/response_length/max':
+            torch.max(response_length).detach().item(),
+        'gen_batch/response_length/mean':
+            torch.mean(response_length).detach().item(),
+    }
+    return metrics
+
+
+def expand_idx_to_group(seq_idxs, group_size):
+    group_seq_idxs = set()
+    for idx in seq_idxs:
+        group_idx = idx // group_size
+        for i in range(group_idx*group_size, (group_idx+1)*group_size):
+            group_seq_idxs.add(i)
+    return sorted(list(group_seq_idxs))
+
+
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -447,6 +489,17 @@ class RayPPOTrainer(object):
             self.use_critic = False
         else:
             raise NotImplementedError
+
+        if config.data.use_partial_rollout:
+            self.max_prompt_length_in_gen = (
+                self.config.data.max_prompt_length + 
+                self.config.data.max_response_length - 
+                self.config.data.max_response_length_in_partial
+            )
+            self.max_response_length_in_gen = self.config.data.max_response_length_in_partial
+        else:
+            self.max_prompt_length_in_gen = self.config.data.max_prompt_length
+            self.max_response_length_in_gen = self.config.data.max_response_length
 
         self._validate_config()
         self._create_dataloader()
@@ -545,7 +598,8 @@ class RayPPOTrainer(object):
                                             max_prompt_length=self.config.data.max_prompt_length,
                                             filter_prompts=True,
                                             return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                            truncation='error',)
+                                            truncation='error',
+                                            padding_size=self.max_prompt_length_in_gen)
         else:
             self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
                                             tokenizer=self.tokenizer,
@@ -556,7 +610,8 @@ class RayPPOTrainer(object):
                                             filter_prompts=True,
                                             return_raw_chat=self.config.data.get('return_raw_chat', False),
                                             truncation='error',
-                                            filter_overlong_prompts=True)
+                                            filter_overlong_prompts=True,
+                                            padding_size=self.max_prompt_length_in_gen)
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
@@ -565,8 +620,8 @@ class RayPPOTrainer(object):
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.train_batch_size,
-                                                   num_workers=8,
+                                                   batch_size=1,
+                                                   num_workers=2,
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
@@ -579,7 +634,8 @@ class RayPPOTrainer(object):
                                        max_prompt_length=self.config.data.max_prompt_length,
                                        filter_prompts=True,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation='error')
+                                       truncation='error',
+                                       padding_size=self.max_prompt_length_in_gen)
         else:
             self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                         tokenizer=self.tokenizer,
@@ -590,7 +646,8 @@ class RayPPOTrainer(object):
                                         filter_prompts=True,
                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
                                         truncation='error',
-                                        filter_overlong_prompts=True)
+                                        filter_overlong_prompts=True,
+                                        padding_size=self.max_prompt_length_in_gen)
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             # Validation datasets are sent to inference engines as a whole batch,
@@ -907,6 +964,87 @@ class RayPPOTrainer(object):
                                                     partitions=global_partition_lst,
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
+        
+
+    def _balance_gen_batch(self, batch: DataProto, metrics, logging_prefix='gen_seqlen'):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        attention_mask = batch.batch['attention_mask']
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        world_size = self.actor_rollout_wg.world_size
+        global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
+                                                              k_partitions=world_size,
+                                                              equal_size=True)
+        # reorder based on index. The data will be automatically equally partitioned by dispatch function
+        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        batch.reorder(global_idx)
+        global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
+                                                    partitions=global_partition_lst,
+                                                    prefix=logging_prefix)
+        metrics.update(global_balance_stats)
+
+        idx_map = {}
+        for i, idx in enumerate(global_idx.tolist()):
+            idx_map[idx] = i
+        
+        reorder_idx = []
+        for i in range(len(batch)):
+            reorder_idx.append(idx_map[i])
+        return torch.tensor(reorder_idx)
+
+    def _get_seq_idx_for_partial_rollout(self, batch):
+        ## unfinish
+        unfinish_mask = (
+            (batch.batch['responses'][:, -1] != self.tokenizer.eos_token_id) & 
+            (batch.batch['responses'][:, -1] != self.tokenizer.pad_token_id)
+        )
+        ## unexceed
+        response_lengths = batch.batch['attention_mask'].sum(-1) - torch.tensor(batch.non_tensor_batch['prompt_length'].astype(int))
+        unexceed_mask = response_lengths < self.config.data.max_response_length
+        #TODO: add repeat detection
+        # pass
+        mask = unfinish_mask & unexceed_mask
+        return torch.nonzero(mask, as_tuple=True)[0].tolist()
+
+    def _recompute_batch(self, batch, old_log_probs):
+        from torch.nn.utils.rnn import pad_sequence
+        from verl.utils.model import compute_position_id_with_mask
+
+        prompt_length = torch.tensor(batch.non_tensor_batch['prompt_length'].astype(int))
+        prompt_start_idx = (batch.batch['input_ids'] != self.tokenizer.pad_token_id).int().argmax(dim=1)
+        prompt_end_idx = prompt_start_idx + prompt_length
+        prompts = [batch.batch['input_ids'][i, prompt_start_idx[i] : prompt_end_idx[i]] for i in range(len(batch))]
+        prompts = torch.stack(
+            [pad_sequence_to_length(prompt, self.config.data.max_prompt_length, self.tokenizer.pad_token_id, left_pad=True) for prompt in prompts]
+        )
+
+        resp_length = batch.batch['attention_mask'].sum(-1) - prompt_length
+        resp_start_idx = prompt_end_idx
+        resp_end_idx = resp_start_idx + resp_length
+        # responses = [batch.batch['input_ids'][i, resp_start_idx[i]:] for i in range(len(batch))]
+        # responses = pad_sequence(responses, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        responses = [batch.batch['input_ids'][i, resp_start_idx[i] : resp_end_idx[i]] for i in range(len(batch))]
+        responses = pad_sequence(responses, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+
+        old_log_probs = pad_sequence(old_log_probs, batch_first=True, padding_value=0.)
+        assert responses.shape == old_log_probs.shape, f"get responses.shape:{responses.shape}, old_log_probs.shape:{old_log_probs.shape}"
+
+        prompt_attention_mask = (prompts != self.tokenizer.pad_token_id).long()
+        response_attention_mask = get_eos_mask(
+            response_id=responses,
+            eos_token=self.tokenizer.eos_token_id,
+            dtype=torch.int64
+        )
+        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
+
+        batch.batch['prompts'] = prompts
+        batch.batch['responses'] = responses
+        batch.batch['input_ids'] = torch.cat([prompts, responses], dim=-1)
+        batch.batch['attention_mask'] = attention_mask
+        batch.batch['position_ids'] = compute_position_id_with_mask(batch.batch['attention_mask'])
+        batch.batch['old_log_probs'] = old_log_probs
+        return batch
+
 
     def fit(self):
         """
@@ -939,32 +1077,152 @@ class RayPPOTrainer(object):
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
-
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        
+        n_samples = self.config.actor_rollout_ref.rollout.n
+        self.partial_batch = DataProto()
+        self.partial_old_log_probs = []
+        for _ in range(self.config.trainer.total_epochs):
+            data_iter = iter(self.train_dataloader)
+            data_exhausted = False  # Flag to indicate if the iterator is exhausted
+            # for batch_dict in self.train_dataloader:
+            while not data_exhausted:
                 metrics = {}
                 timing_raw = {}
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                new_batch = []
+                for _ in range(self.config.data.train_batch_size - len(self.partial_batch) // n_samples):
+                    try:
+                        batch_dict = next(data_iter)
+                        new_batch.append(DataProto.from_single_dict(batch_dict))
+                    except StopIteration:
+                        data_exhausted = True
 
-                # pop those keys for generation
-                if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
-                    gen_batch = batch.pop(
-                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
-                    )
-                else:
-                    gen_batch = batch.pop(
-                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids'],
-                    )
+                # If the iterator is exhausted, break the outer while loop as well
+                if data_exhausted:
+                    print("Data iterator exhausted, breaking the loop.")
+                    break
+
+                if len(new_batch) > 0:
+                    new_batch = DataProto.concat(new_batch)
+                    new_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object)
+                    new_batch.non_tensor_batch['continue_generate'] = np.array([False for _ in range(len(new_batch.batch))], dtype=object)
+                    new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                gen_batch = []
+                # add data from new batch
+                if len(new_batch) > 0:
+                    if 'multi_modal_inputs' in new_batch.non_tensor_batch.keys():
+                        gen_batch.append(new_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                                                       non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs']))
+                    else:
+                        gen_batch.append(new_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids']))
+
+                # add data from partial batch
+                idx_in_partial_batch = []
+                if len(self.partial_batch) > 0:
+                    idx_in_partial_batch = (np.where(self.partial_batch.non_tensor_batch['continue_generate']==True)[0]).tolist()
+                    partial_gen_batch = dataprotoitem_to_dataproto(self.partial_batch[idx_in_partial_batch])
+                    if 'multi_modal_inputs' in partial_gen_batch.non_tensor_batch.keys():
+                        partial_gen_batch = partial_gen_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                                                                  non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'])
+                    else:
+                        partial_gen_batch = partial_gen_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                    for key in partial_gen_batch.batch.keys():
+                        partial_gen_batch.batch[key] = partial_gen_batch.batch[key][:, self.max_response_length_in_gen:]
+                    gen_batch.append(partial_gen_batch)
+                gen_batch = DataProto.concat(gen_batch)
+                # pad to be divisible by dp_size
+                gen_batch, padding_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_wg.world_size)
+                        
+                metrics['batch/partial_rollout_num'] = len(self.partial_batch)
+                metrics['batch/continue_generate_num'] = len(idx_in_partial_batch)
+                print(f"step: {self.global_steps}, len(new_batch): {len(new_batch)}, len(partial_batch):{len(self.partial_batch)}, ",
+                      f"len(continue_gen):{len(idx_in_partial_batch)}, len(gen_batch): {len(gen_batch)}, padding_size:{padding_size}")
+
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
+                        gen_batch.meta_info['n'] = 1
+                        gen_batch.meta_info['max_tokens'] = self.max_response_length_in_gen
+                        reorder_idx = self._balance_gen_batch(gen_batch, metrics)
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        gen_batch_output.reorder(reorder_idx)
+                        metrics.update(compute_generate_data_metrics(gen_batch_output))
+
+                    batch = []
+                    if len(new_batch) > 0:
+                        new_batch_output = gen_batch_output[:len(new_batch)]
+                        new_batch = new_batch.union(new_batch_output)
+                        batch.append(new_batch)
+
+                    if len(self.partial_batch) > 0 :
+                        partial_batch_output = gen_batch_output[len(new_batch): len(new_batch)+len(idx_in_partial_batch)]
+                        self.partial_batch[idx_in_partial_batch] = partial_batch_output
+                        self.partial_batch.non_tensor_batch['continue_generate'][:] = False
+                        batch.append(self.partial_batch)
+                    batch = DataProto.concat(batch)
+
+                    # recompute old_log_probs
+                    with _timer('old_log_prob', timing_raw):
+                        old_log_prob_proto = self.actor_rollout_wg.compute_log_prob(batch)
+
+                        if self.config.data.use_partial_rollout:
+                            from verl.protocol import union_numpy_dict
+                            from verl.utils.py_functional import union_two_dict
+                            batch.non_tensor_batch = union_numpy_dict(batch.non_tensor_batch, old_log_prob_proto.non_tensor_batch)
+                            batch.meta_info = union_two_dict(batch.meta_info, old_log_prob_proto.meta_info)
+
+                            response_lengths = _compute_response_info(batch)['response_length'].int()
+                            old_log_probs = old_log_prob_proto.batch['old_log_probs']
+                            old_log_probs = [old_log_probs[i, :response_lengths[i]] for i in range(old_log_probs.shape[0])]
+
+                            if len(self.partial_batch) > 0:
+                                for i in range(len(self.partial_batch)):
+                                    idx_b = i + len(new_batch)
+                                    if i in idx_in_partial_batch:
+                                        old_log_probs[idx_b] = torch.cat(
+                                            (self.partial_old_log_probs[i], old_log_probs[idx_b])
+                                        )
+                                    else:
+                                        old_log_probs[idx_b] = self.partial_old_log_probs[i]
+                        else:
+                            batch = batch.union(old_log_prob_proto)
+
+                    # get partial rollout
+                    if self.config.data.use_partial_rollout:
+                        partial_idxs = self._get_seq_idx_for_partial_rollout(batch)
+                        if len(partial_idxs) > 0:
+                            batch.non_tensor_batch['continue_generate'][partial_idxs] = True
+                            if self.config.algorithm.adv_estimator == "grpo":
+                                partial_idxs = expand_idx_to_group(partial_idxs, n_samples)
+
+                        remain_idxs = [i for i in range(len(batch)) if i not in partial_idxs]
+                        
+                        print(f"step:{self.global_steps}, len(remain_idxs):{len(remain_idxs)}, len(partial_idxs):{len(partial_idxs)}")
+                        if len(remain_idxs) < len(batch) * self.config.data.train_num_threshold:
+                            partial_idxs = list(range(len(batch)))
+                            self.partial_batch = dataprotoitem_to_dataproto(batch[partial_idxs])
+                            self.partial_old_log_probs = [old_log_probs[idx] for idx in partial_idxs]
+                            continue
+                        else:
+                            if len(partial_idxs) > 0:
+                                self.partial_batch = dataprotoitem_to_dataproto(batch[partial_idxs])
+                                self.partial_old_log_probs = [old_log_probs[idx] for idx in partial_idxs]
+                            else:
+                                self.partial_batch = DataProto()
+                                self.partial_old_log_probs = []
+
+                        metrics['batch/train_seq_num'] = len(remain_idxs)
+                        metrics['batch/train_new_num'] = len([i for i in remain_idxs if i < len(new_batch)])
+
+                        batch = dataprotoitem_to_dataproto(batch[remain_idxs])
+                        old_log_probs = [old_log_probs[idx] for idx in remain_idxs]
+                        # reset prompt and response for training
+                        batch = self._recompute_batch(batch, old_log_probs)
+                        batch, _ = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer('gen_max', timing_raw):
@@ -982,11 +1240,11 @@ class RayPPOTrainer(object):
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                    #                                          dtype=object)
+                    # # repeat to align with repeated responses in rollout
+                    # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # batch = batch.union(gen_batch_output)
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -997,9 +1255,9 @@ class RayPPOTrainer(object):
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                    # with _timer('old_log_prob', timing_raw):
+                    #     old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                    #     batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1091,6 +1349,7 @@ class RayPPOTrainer(object):
                             val_metrics: dict = self._validate()
                             if is_last_step:
                                 last_val_metrics = val_metrics
+                            pprint(f'validation metrics: {val_metrics}')
                         metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and ( is_last_step or \

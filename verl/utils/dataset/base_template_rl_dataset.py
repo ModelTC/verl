@@ -110,7 +110,7 @@ class BaseTemplateRLHFDataset(Dataset):
         row_dict['input_ids'] = input_ids[0]
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
-        row_dict['raw_prompt_ids'] = self.tokenizer.encode(chat[0]['content'], add_special_tokens=False)
+        # row_dict['raw_prompt_ids'] = self.tokenizer.encode(chat[0]['content'], add_special_tokens=False)
 
         # encode prompts without chat template
         if self.return_raw_chat:

@@ -89,9 +89,11 @@ class RLHFDataset(Dataset):
                  chat_template_func=None,
                  return_raw_chat=False,
                  truncation='error',
-                 filter_overlong_prompts=False):
+                 filter_overlong_prompts=False,
+                 padding_size=None):
         if not isinstance(parquet_files, (List, ListConfig)):
             parquet_files = [parquet_files]
+        self.padding_size = padding_size if padding_size is not None else self.max_prompt_length
 
         self.parquet_files = copy.deepcopy(parquet_files)
         self.original_parquet_files = copy.deepcopy(parquet_files)  # use for resume
@@ -189,7 +191,7 @@ class RLHFDataset(Dataset):
 
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
                                                                          tokenizer=self.tokenizer,
-                                                                         max_length=self.max_prompt_length,
+                                                                         max_length=self.padding_size,
                                                                          pad_token_id=self.tokenizer.pad_token_id,
                                                                          left_pad=True,
                                                                          truncation=self.truncation)
@@ -209,7 +211,8 @@ class RLHFDataset(Dataset):
         row_dict['input_ids'] = input_ids[0]
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
-        row_dict['raw_prompt_ids'] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        # TODO add raw prompt ids to adapt partial
+        # row_dict['raw_prompt_ids'] = self.tokenizer.encode(raw_prompt, add_special_tokens=False) 
 
         # encode prompts without chat template
         if self.return_raw_chat:
@@ -218,6 +221,8 @@ class RLHFDataset(Dataset):
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
         row_dict["index"] = index
+        
+        row_dict["prompt_length"] = row_dict['position_ids'].max().item() + 1
 
         return row_dict
 
