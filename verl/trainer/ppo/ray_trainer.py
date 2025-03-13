@@ -1147,6 +1147,7 @@ class RayPPOTrainer(object):
                     with _timer('gen', timing_raw):
                         gen_batch.meta_info['n'] = 1
                         gen_batch.meta_info['max_tokens'] = self.max_response_length_in_gen
+                        self.actor_rollout_wg.init_vllm_manager()
                         reorder_idx = self._balance_gen_batch(gen_batch, metrics)
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         gen_batch_output.reorder(reorder_idx)
@@ -1164,6 +1165,20 @@ class RayPPOTrainer(object):
                         self.partial_batch.non_tensor_batch['continue_generate'][:] = False
                         batch.append(self.partial_batch)
                     batch = DataProto.concat(batch)
+                    
+                    if self.config.data.use_partial_rollout:
+                        partial_idxs = self._get_seq_idx_for_partial_rollout(batch)
+                        if len(partial_idxs) > 0:
+                            batch.non_tensor_batch['continue_generate'][partial_idxs] = True
+                            if self.config.algorithm.adv_estimator == "grpo":
+                                partial_idxs = expand_idx_to_group(partial_idxs, n_samples)
+
+                        remain_idxs = [i for i in range(len(batch)) if i not in partial_idxs]
+                        
+                        # print(f"step:{self.global_steps}, len(remain_idxs):{len(remain_idxs)}, len(partial_idxs):{len(partial_idxs)}")
+                        if len(remain_idxs) >= len(batch) * self.config.data.train_num_threshold:
+                            self.actor_rollout_wg.clear_vllm_manager()
+
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):

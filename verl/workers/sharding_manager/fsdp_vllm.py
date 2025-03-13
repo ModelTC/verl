@@ -68,8 +68,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             torch.cuda.set_rng_state(self.torch_random_states)
         else:
             self.gen_random_states = None
-
-    def __enter__(self):
+        self.status = False
+            
+    def init_vllm(self):
+        if self.status:
+            return
+        self.status = True
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
@@ -103,8 +107,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.torch_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.gen_random_states)
-
-    def __exit__(self, exc_type, exc_value, traceback):
+    
+    def __enter__(self):
+        self.init_vllm()
+        
+    def clear_vllm(self):
+        if not self.status:
+            return
+        self.status = False
         log_gpu_memory_usage('Before vllm offload in sharding manager', logger=logger)
         # TODO(ZSL): check this
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
@@ -126,6 +136,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.torch_random_states)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.clear_vllm()
 
     def preprocess_data(self, data: DataProto) -> DataProto:
         # TODO: Current impl doesn't consider FSDP with torch micro-dp

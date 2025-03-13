@@ -458,6 +458,14 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
         torch.cuda.empty_cache()
         return output
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_vllm_manager(self):
+        self.rollout_sharding_manager.init_vllm()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_vllm_manager(self):
+        self.rollout_sharding_manager.clear_vllm()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
@@ -479,22 +487,22 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        with self.rollout_sharding_manager:
-
+        # with self.rollout_sharding_manager:
+        # self.rollout_sharding_manager.init_vllm()
             # after parameters sync with rollout, offload actor model to CPU
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
-            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+        log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+        prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+        output = self.rollout.generate_sequences(prompts=prompts)
 
-            log_gpu_memory_usage('After rollout generation', logger=logger)
+        log_gpu_memory_usage('After rollout generation', logger=logger)
 
-            output = self.rollout_sharding_manager.postprocess_data(output)
+        output = self.rollout_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')
 
