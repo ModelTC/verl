@@ -112,8 +112,6 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.init_vllm()
         
     def clear_vllm(self):
-        if not self.status:
-            return
         self.status = False
         log_gpu_memory_usage('Before vllm offload in sharding manager', logger=logger)
         # TODO(ZSL): check this
