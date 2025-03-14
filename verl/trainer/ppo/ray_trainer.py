@@ -736,8 +736,7 @@ class RayPPOTrainer(object):
                 )
             else:
                 test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids'],
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids']
                 )
 
             test_gen_batch.meta_info = {
