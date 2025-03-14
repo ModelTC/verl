@@ -42,6 +42,8 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from verl.trainer.ppo.partial_utils import _balance_gen_batch, get_partial_batch, get_partial_old_log_prob, get_new_batch, get_solve_all_none_metrics
+
 
 
 WorkerType = Type[Worker]
@@ -966,86 +968,6 @@ class RayPPOTrainer(object):
         metrics.update(global_balance_stats)
         
 
-    def _balance_gen_batch(self, batch: DataProto, metrics, logging_prefix='gen_seqlen'):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        attention_mask = batch.batch['attention_mask']
-        batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_rollout_wg.world_size
-        global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
-                                                              k_partitions=world_size,
-                                                              equal_size=True)
-        # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
-        batch.reorder(global_idx)
-        global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
-                                                    partitions=global_partition_lst,
-                                                    prefix=logging_prefix)
-        metrics.update(global_balance_stats)
-
-        idx_map = {}
-        for i, idx in enumerate(global_idx.tolist()):
-            idx_map[idx] = i
-        
-        reorder_idx = []
-        for i in range(len(batch)):
-            reorder_idx.append(idx_map[i])
-        return torch.tensor(reorder_idx)
-
-    def _get_seq_idx_for_partial_rollout(self, batch):
-        ## unfinish
-        unfinish_mask = (
-            (batch.batch['responses'][:, -1] != self.tokenizer.eos_token_id) & 
-            (batch.batch['responses'][:, -1] != self.tokenizer.pad_token_id)
-        )
-        ## unexceed
-        response_lengths = batch.batch['attention_mask'].sum(-1) - torch.tensor(batch.non_tensor_batch['prompt_length'].astype(int))
-        unexceed_mask = response_lengths < self.config.data.max_response_length
-        #TODO: add repeat detection
-        # pass
-        mask = unfinish_mask & unexceed_mask
-        return torch.nonzero(mask, as_tuple=True)[0].tolist()
-
-    def _recompute_batch(self, batch, old_log_probs):
-        from torch.nn.utils.rnn import pad_sequence
-        from verl.utils.model import compute_position_id_with_mask
-
-        prompt_length = torch.tensor(batch.non_tensor_batch['prompt_length'].astype(int))
-        prompt_start_idx = (batch.batch['input_ids'] != self.tokenizer.pad_token_id).int().argmax(dim=1)
-        prompt_end_idx = prompt_start_idx + prompt_length
-        prompts = [batch.batch['input_ids'][i, prompt_start_idx[i] : prompt_end_idx[i]] for i in range(len(batch))]
-        prompts = torch.stack(
-            [pad_sequence_to_length(prompt, self.config.data.max_prompt_length, self.tokenizer.pad_token_id, left_pad=True) for prompt in prompts]
-        )
-
-        resp_length = batch.batch['attention_mask'].sum(-1) - prompt_length
-        resp_start_idx = prompt_end_idx
-        resp_end_idx = resp_start_idx + resp_length
-        # responses = [batch.batch['input_ids'][i, resp_start_idx[i]:] for i in range(len(batch))]
-        # responses = pad_sequence(responses, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        responses = [batch.batch['input_ids'][i, resp_start_idx[i] : resp_end_idx[i]] for i in range(len(batch))]
-        responses = pad_sequence(responses, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-
-        old_log_probs = pad_sequence(old_log_probs, batch_first=True, padding_value=0.)
-        assert responses.shape == old_log_probs.shape, f"get responses.shape:{responses.shape}, old_log_probs.shape:{old_log_probs.shape}"
-
-        prompt_attention_mask = (prompts != self.tokenizer.pad_token_id).long()
-        response_attention_mask = get_eos_mask(
-            response_id=responses,
-            eos_token=self.tokenizer.eos_token_id,
-            dtype=torch.int64
-        )
-        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
-
-        batch.batch['prompts'] = prompts
-        batch.batch['responses'] = responses
-        batch.batch['input_ids'] = torch.cat([prompts, responses], dim=-1)
-        batch.batch['attention_mask'] = attention_mask
-        batch.batch['position_ids'] = compute_position_id_with_mask(batch.batch['attention_mask'])
-        batch.batch['old_log_probs'] = old_log_probs
-        return batch
-
-
     def fit(self):
         """
         The training loop of PPO.
@@ -1078,299 +1000,189 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         last_val_metrics = None
         
-        n_samples = self.config.actor_rollout_ref.rollout.n
         self.partial_batch = DataProto()
         self.partial_old_log_probs = []
-        for _ in range(self.config.trainer.total_epochs):
-            data_iter = iter(self.train_dataloader)
-            data_exhausted = False  # Flag to indicate if the iterator is exhausted
-            # for batch_dict in self.train_dataloader:
-            while not data_exhausted:
-                metrics = {}
-                timing_raw = {}
+        
+        world_size = self.actor_rollout_wg.world_size
+        data_iter = iter(self.train_dataloader)
+        for _ in range(self.total_training_steps):
+            metrics = {}
+            timing_raw = {}                
+            data_iter, gen_batch, new_batch, padding_size, idx_in_partial_batch = get_new_batch(data_iter,
+                                                                                                self.train_dataloader,
+                                                                                                self.config,
+                                                                                                self.partial_batch,
+                                                                                                self.max_response_length_in_gen,
+                                                                                                world_size)
+            metrics['batch/partial_rollout_num'] = len(self.partial_batch)
+            metrics['batch/continue_generate_num'] = len(idx_in_partial_batch)
+            print(f"step: {self.global_steps}, len(new_batch): {len(new_batch)}, len(partial_batch):{len(self.partial_batch)}, ",
+                    f"len(continue_gen):{len(idx_in_partial_batch)}, len(gen_batch): {len(gen_batch)}, padding_size:{padding_size}")
 
-                new_batch = []
-                for _ in range(self.config.data.train_batch_size - len(self.partial_batch) // n_samples):
-                    try:
-                        batch_dict = next(data_iter)
-                        new_batch.append(DataProto.from_single_dict(batch_dict))
-                    except StopIteration:
-                        data_exhausted = True
 
-                # If the iterator is exhausted, break the outer while loop as well
-                if data_exhausted:
-                    print("Data iterator exhausted, breaking the loop.")
-                    break
+            is_last_step = self.global_steps >= self.total_training_steps
 
+            with _timer('step', timing_raw):
+                # generate a batch
+                with _timer('gen', timing_raw):
+                    gen_batch.meta_info['n'] = 1
+                    gen_batch.meta_info['max_tokens'] = self.max_response_length_in_gen
+                    reorder_idx = _balance_gen_batch(gen_batch, metrics, logging_prefix='gen_seqlen', world_size=world_size)
+                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                    gen_batch_output.reorder(reorder_idx)
+                    metrics.update(compute_generate_data_metrics(gen_batch_output))
+
+                batch = []
                 if len(new_batch) > 0:
-                    new_batch = DataProto.concat(new_batch)
-                    new_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object)
-                    new_batch.non_tensor_batch['continue_generate'] = np.array([False for _ in range(len(new_batch.batch))], dtype=object)
-                    new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    new_batch_output = gen_batch_output[:len(new_batch)]
+                    new_batch = new_batch.union(new_batch_output)
+                    batch.append(new_batch)
 
-                gen_batch = []
-                # add data from new batch
-                if len(new_batch) > 0:
-                    if 'multi_modal_inputs' in new_batch.non_tensor_batch.keys():
-                        gen_batch.append(new_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                                                       non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs']))
-                    else:
-                        gen_batch.append(new_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids']))
+                if len(self.partial_batch) > 0 :
+                    partial_batch_output = gen_batch_output[len(new_batch): len(new_batch)+len(idx_in_partial_batch)]
+                    self.partial_batch[idx_in_partial_batch] = partial_batch_output
+                    self.partial_batch.non_tensor_batch['continue_generate'][:] = False
+                    batch.append(self.partial_batch)
+                batch = DataProto.concat(batch)
 
-                # add data from partial batch
-                idx_in_partial_batch = []
-                if len(self.partial_batch) > 0:
-                    idx_in_partial_batch = (np.where(self.partial_batch.non_tensor_batch['continue_generate']==True)[0]).tolist()
-                    partial_gen_batch = dataprotoitem_to_dataproto(self.partial_batch[idx_in_partial_batch])
-                    if 'multi_modal_inputs' in partial_gen_batch.non_tensor_batch.keys():
-                        partial_gen_batch = partial_gen_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                                                                  non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'])
-                    else:
-                        partial_gen_batch = partial_gen_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
-                    for key in partial_gen_batch.batch.keys():
-                        partial_gen_batch.batch[key] = partial_gen_batch.batch[key][:, self.max_response_length_in_gen:]
-                    gen_batch.append(partial_gen_batch)
-                gen_batch = DataProto.concat(gen_batch)
-                # pad to be divisible by dp_size
-                gen_batch, padding_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_wg.world_size)
-                        
-                metrics['batch/partial_rollout_num'] = len(self.partial_batch)
-                metrics['batch/continue_generate_num'] = len(idx_in_partial_batch)
-                print(f"step: {self.global_steps}, len(new_batch): {len(new_batch)}, len(partial_batch):{len(self.partial_batch)}, ",
-                      f"len(continue_gen):{len(idx_in_partial_batch)}, len(gen_batch): {len(gen_batch)}, padding_size:{padding_size}")
+                # recompute old_log_probs
+                with _timer('old_log_prob', timing_raw):
+                    old_log_prob_proto = self.actor_rollout_wg.compute_log_prob(batch)
 
-
-                is_last_step = self.global_steps >= self.total_training_steps
-
-                with _timer('step', timing_raw):
-                    # generate a batch
-                    with _timer('gen', timing_raw):
-                        gen_batch.meta_info['n'] = 1
-                        gen_batch.meta_info['max_tokens'] = self.max_response_length_in_gen
-                        reorder_idx = self._balance_gen_batch(gen_batch, metrics)
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        gen_batch_output.reorder(reorder_idx)
-                        metrics.update(compute_generate_data_metrics(gen_batch_output))
-
-                    batch = []
-                    if len(new_batch) > 0:
-                        new_batch_output = gen_batch_output[:len(new_batch)]
-                        new_batch = new_batch.union(new_batch_output)
-                        batch.append(new_batch)
-
-                    if len(self.partial_batch) > 0 :
-                        partial_batch_output = gen_batch_output[len(new_batch): len(new_batch)+len(idx_in_partial_batch)]
-                        self.partial_batch[idx_in_partial_batch] = partial_batch_output
-                        self.partial_batch.non_tensor_batch['continue_generate'][:] = False
-                        batch.append(self.partial_batch)
-                    batch = DataProto.concat(batch)
-
-                    # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
-                        old_log_prob_proto = self.actor_rollout_wg.compute_log_prob(batch)
-
-                        if self.config.data.use_partial_rollout:
-                            from verl.protocol import union_numpy_dict
-                            from verl.utils.py_functional import union_two_dict
-                            batch.non_tensor_batch = union_numpy_dict(batch.non_tensor_batch, old_log_prob_proto.non_tensor_batch)
-                            batch.meta_info = union_two_dict(batch.meta_info, old_log_prob_proto.meta_info)
-
-                            response_lengths = _compute_response_info(batch)['response_length'].int()
-                            old_log_probs = old_log_prob_proto.batch['old_log_probs']
-                            old_log_probs = [old_log_probs[i, :response_lengths[i]] for i in range(old_log_probs.shape[0])]
-
-                            if len(self.partial_batch) > 0:
-                                for i in range(len(self.partial_batch)):
-                                    idx_b = i + len(new_batch)
-                                    if i in idx_in_partial_batch:
-                                        old_log_probs[idx_b] = torch.cat(
-                                            (self.partial_old_log_probs[i], old_log_probs[idx_b])
-                                        )
-                                    else:
-                                        old_log_probs[idx_b] = self.partial_old_log_probs[i]
-                        else:
-                            batch = batch.union(old_log_prob_proto)
-
-                    # get partial rollout
                     if self.config.data.use_partial_rollout:
-                        partial_idxs = self._get_seq_idx_for_partial_rollout(batch)
-                        if len(partial_idxs) > 0:
-                            batch.non_tensor_batch['continue_generate'][partial_idxs] = True
-                            if self.config.algorithm.adv_estimator == "grpo":
-                                partial_idxs = expand_idx_to_group(partial_idxs, n_samples)
+                        batch, old_log_probs = get_partial_old_log_prob(batch,
+                                                                    self.partial_batch,
+                                                                    self.partial_old_log_probs,
+                                                                    idx_in_partial_batch,
+                                                                    old_log_prob_proto,
+                                                                    new_batch)
+                    else:
+                        batch = batch.union(old_log_prob_proto)
 
-                        remain_idxs = [i for i in range(len(batch)) if i not in partial_idxs]
-                        
-                        print(f"step:{self.global_steps}, len(remain_idxs):{len(remain_idxs)}, len(partial_idxs):{len(partial_idxs)}")
-                        if len(remain_idxs) < len(batch) * self.config.data.train_num_threshold:
-                            partial_idxs = list(range(len(batch)))
-                            self.partial_batch = dataprotoitem_to_dataproto(batch[partial_idxs])
-                            self.partial_old_log_probs = [old_log_probs[idx] for idx in partial_idxs]
-                            continue
-                        else:
-                            if len(partial_idxs) > 0:
-                                self.partial_batch = dataprotoitem_to_dataproto(batch[partial_idxs])
-                                self.partial_old_log_probs = [old_log_probs[idx] for idx in partial_idxs]
-                            else:
-                                self.partial_batch = DataProto()
-                                self.partial_old_log_probs = []
+                # get partial rollout
+                if self.config.data.use_partial_rollout:
+                    batch, self.partial_batch, self.partial_old_log_probs, stop = get_partial_batch(batch,
+                                                                                    self.config,
+                                                                                    self.tokenizer,
+                                                                                    old_log_probs,
+                                                                                    world_size,
+                                                                                    self.global_steps,
+                                                                                    metrics,
+                                                                                    new_batch)
+                    if stop:
+                        continue
 
-                        metrics['batch/train_seq_num'] = len(remain_idxs)
-                        metrics['batch/train_new_num'] = len([i for i in remain_idxs if i < len(new_batch)])
+                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    with _timer('gen_max', timing_raw):
+                        gen_baseline_batch = deepcopy(gen_batch)
+                        gen_baseline_batch.meta_info['do_sample'] = False
+                        gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
-                        batch = dataprotoitem_to_dataproto(batch[remain_idxs])
-                        old_log_probs = [old_log_probs[idx] for idx in remain_idxs]
-                        # reset prompt and response for training
-                        batch = self._recompute_batch(batch, old_log_probs)
-                        batch, _ = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+                        batch = batch.union(gen_baseline_output)
+                        reward_baseline_tensor = self.reward_fn(batch)
+                        reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info['do_sample'] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                        batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                        batch.batch['reward_baselines'] = reward_baseline_tensor
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                        del gen_baseline_batch, gen_baseline_output
 
-                            batch.batch['reward_baselines'] = reward_baseline_tensor
 
-                            del gen_baseline_batch, gen_baseline_output
+                self._balance_batch(batch, metrics=metrics)
 
-                    # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                    #                                          dtype=object)
-                    # # repeat to align with repeated responses in rollout
-                    # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    # batch = batch.union(gen_batch_output)
+                # compute global_valid tokens
+                batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                if self.use_reference_policy:
+                    # compute reference log_prob
+                    with _timer('ref', timing_raw):
+                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                        batch = batch.union(ref_log_prob)
 
-                    # recompute old_log_probs
-                    # with _timer('old_log_prob', timing_raw):
-                    #     old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                    #     batch = batch.union(old_log_prob)
+                # compute values
+                if self.use_critic:
+                    with _timer('values', timing_raw):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                with _timer('adv', timing_raw):
+                    # compute scores. Support both model and function-based.
+                    # We first compute the scores using reward model. Then, we call reward_fn to combine
+                    # the results from reward model and rule-based results.
+                    if self.use_rm:
+                        # we first compute reward model score
+                        reward_tensor = self.rm_wg.compute_rm_score(batch)
+                        batch = batch.union(reward_tensor)
 
-                    # compute values
-                    if self.use_critic:
-                        with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                    # we combine with rule-based rm
+                    with _timer('reward_fn', timing_raw):
+                        reward_tensor, reward_info = self.reward_fn(batch)
+                        batch.batch['token_level_scores'] = reward_tensor
+                
+                    get_solve_all_none_metrics(batch, reward_tensor, reward_info, metrics)
 
-                    with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                    # compute rewards. apply_kl_penalty if available
+                    if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                        batch, kl_metrics = apply_kl_penalty(batch,
+                                                                kl_ctrl=self.kl_ctrl,
+                                                                kl_penalty=self.config.algorithm.kl_penalty)
+                        metrics.update(kl_metrics)
+                    else:
+                        batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                        # we combine with rule-based rm
-                        with _timer('reward_fn', timing_raw):
-                            reward_tensor, reward_info = self.reward_fn(batch)
-                            batch.batch['token_level_scores'] = reward_tensor
-                        # reward_tensor = self.reward_fn(batch)
-                        # batch.batch['token_level_scores'] = reward_tensor
+                    # compute advantages, executed on the driver process
+                    batch = compute_advantage(batch,
+                                                adv_estimator=self.config.algorithm.adv_estimator,
+                                                gamma=self.config.algorithm.gamma,
+                                                lam=self.config.algorithm.lam,
+                                                num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                        uids = batch.non_tensor_batch['uid']
-                        unique_uids = np.unique(uids)
-                        valid_mask = torch.ones(len(uids), dtype=torch.bool)
-                        solve_none = 0
-                        solve_all = 0
-                        for uid in unique_uids:
-                            uid_mask = uids == uid
-                            uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
-                            
-                            # Check if all rewards are 0 or all are 1 for this uid
-                            if (uid_rewards == 0).all():
-                                valid_mask[uid_mask] = False
-                                solve_none += 1
-                            elif (uid_rewards == 1).all():
-                                valid_mask[uid_mask] = False
-                                solve_all += 1
-                        
-                        # Log to metrics
-                        metrics['batch/solve_none'] = solve_none
-                        metrics['batch/solve_all'] = solve_all
+                # update critic
+                if self.use_critic:
+                    with _timer('update_critic', timing_raw):
+                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                    metrics.update(critic_output_metrics)
 
-                        for key in reward_info:
-                            metrics[f'critic/{key}_reward/mean'] = reward_info[key].mean().item()
+                # implement critic warmup
+                if self.config.trainer.critic_warmup <= self.global_steps:
+                    # update actor
+                    with _timer('update_actor', timing_raw):
+                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                    metrics.update(actor_output_metrics)
 
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                # validate
+                if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                    (is_last_step or  self.global_steps % self.config.trainer.test_freq == 0):
+                    with _timer('testing', timing_raw):
+                        val_metrics: dict = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                        pprint(f'validation metrics: {val_metrics}')
+                    metrics.update(val_metrics)
 
-                        # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                if self.config.trainer.save_freq > 0 and ( is_last_step or \
+                        self.global_steps % self.config.trainer.save_freq == 0):
+                    with _timer('save_checkpoint', timing_raw):
+                        self._save_checkpoint()
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
+            # collect metrics
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+            config = self.config
+            n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+            # Implement actual tflpo and theoretical tflpo
+            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
-                    # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        (is_last_step or  self.global_steps % self.config.trainer.test_freq == 0):
-                        with _timer('testing', timing_raw):
-                            val_metrics: dict = self._validate()
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                            pprint(f'validation metrics: {val_metrics}')
-                        metrics.update(val_metrics)
+            # TODO: make a canonical logger that supports various backend
+            logger.log(data=metrics, step=self.global_steps)
 
-                    if self.config.trainer.save_freq > 0 and ( is_last_step or \
-                            self.global_steps % self.config.trainer.save_freq == 0):
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+            if is_last_step:
+                pprint(f'Final validation metrics: {last_val_metrics}')
+                return
 
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-
-                config = self.config
-                n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-                # Implement actual tflpo and theoretical tflpo
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-
-                if is_last_step:
-                    pprint(f'Final validation metrics: {last_val_metrics}')
-                    return
-
-                self.global_steps += 1
+            self.global_steps += 1
