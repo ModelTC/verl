@@ -753,7 +753,9 @@ class RayPPOTrainer(object):
                 test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
             else:
                 test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.temperature
+            self.actor_rollout_wg.init_vllm_manager()
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            self.actor_rollout_wg.clear_vllm_manager()
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
