@@ -114,7 +114,7 @@ class RewardManager():
             sequences_str = self.tokenizer.decode(sequences)
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-            print(sequences_str)
+            # print(sequences_str)
             print(f'ground_truth:{ground_truth}')
             print(reward_info)
 

@@ -72,14 +72,20 @@ class FSDPVLLMShardingManager(BaseShardingManager):
     def __enter__(self):
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
+        # fsdp offload
+        # state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        # with FSDP.state_dict_type(self.module, StateDictType.SHARDED_STATE_DICT, state_dict_cfg):
+        #     params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
         # Copy, not share memory
         load_format = 'hf' if self.full_params else 'dtensor'
 
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
+            del params
+            torch.cuda.empty_cache()
         else:
-            self.inference_engine.wake_up()
+            self.inference_engine.wake_up(level=2)
             # TODO(ZSL): deal with 'hf' format
             if load_format == 'dtensor':
                 from verl.third_party.vllm import load_dtensor_weights
@@ -87,10 +93,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
             else:
                 raise NotImplementedError(f'load_format {load_format} not implemented')
+            del params
+            torch.cuda.empty_cache()
+            self.inference_engine.wake_up(level=3)
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
 
-        del params
-        torch.cuda.empty_cache()
+
         log_gpu_memory_usage('After del state_dict and empty_cache in sharding manager', logger=logger)
 
         # TODO: offload FSDP model weights
