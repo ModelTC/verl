@@ -207,6 +207,11 @@ class vLLMRollout(BaseRollout):
                 # 'n': self.config.val_kwargs.n,
             }
 
+        # supporting adding any sampling params from meta_info 
+        for k in prompts.meta_info.keys():
+            if hasattr(SamplingParams(), str(k)):
+                kwargs[k] = prompts.meta_info[k]
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
@@ -222,17 +227,19 @@ class vLLMRollout(BaseRollout):
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
 
+            pad_response_length = prompts.meta_info.get('max_tokens', self.config.response_length)
             response = pad_2d_list_to_length(response, self.pad_token_id,
-                                             max_length=self.config.response_length).to(idx.device)
+                                             max_length=pad_response_length).to(idx.device)
 
-            if self.sampling_params.n > 1 and do_sample:
-                idx = _repeat_interleave(idx, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                batch_size = batch_size * self.sampling_params.n
+            n = prompts.meta_info.get('n', self.sampling_params.n)
+            if n > 1 and do_sample:
+                idx = _repeat_interleave(idx, n)
+                attention_mask = _repeat_interleave(attention_mask, n)
+                position_ids = _repeat_interleave(position_ids, n)
+                batch_size = batch_size * n
                 if 'multi_modal_inputs' in non_tensor_batch.keys():
                     non_tensor_batch['multi_modal_inputs'] = _repeat_interleave(non_tensor_batch['multi_modal_inputs'],
-                                                                                self.sampling_params.n)
+                                                                                n)
 
             seq = torch.cat([idx, response], dim=-1)
 
