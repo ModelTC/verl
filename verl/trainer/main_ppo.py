@@ -142,6 +142,9 @@ def main_task(config):
     elif reward_manager_name == 'prime':
         from verl.workers.reward_manager import PrimeRewardManager
         reward_manager_cls = PrimeRewardManager
+    elif reward_manager_name == 'deepscaler':
+        from verl.workers.reward_manager import DeepScalerRewardManager 
+        reward_manager_cls = DeepScalerRewardManager
     else:
         raise NotImplementedError
 
