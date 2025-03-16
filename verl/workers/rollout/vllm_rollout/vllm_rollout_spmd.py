@@ -204,7 +204,7 @@ class vLLMRollout(BaseRollout):
                 'top_k': self.config.val_kwargs.top_k,
                 'top_p': self.config.val_kwargs.top_p,
                 'temperature': self.config.val_kwargs.temperature,
-                'n': self.config.val_kwargs.n,
+                # 'n': self.config.val_kwargs.n,
             }
 
         # users can customize different sampling_params at different run
