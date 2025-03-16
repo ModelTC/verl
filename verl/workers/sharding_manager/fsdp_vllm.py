@@ -84,6 +84,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
+        # fsdp offload
+        # state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        # with FSDP.state_dict_type(self.module, StateDictType.SHARDED_STATE_DICT, state_dict_cfg):
+        #     params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
         # Copy, not share memory
         load_format = 'hf' if self.full_params else 'dtensor'
@@ -91,16 +95,22 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
-            self.inference_engine.wake_up()
+            # self.inference_engine.wake_up()
+            # to reduce GPU memory usage peak
+            # level=1, mean load weights and kv cache, level=2 mean load weights, level=3 mean load kv cache
+            self.inference_engine.wake_up(level=2)
             world_size = torch.distributed.get_world_size()
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             loaded_params = model.load_weights(
                 ((name, param.full_tensor() if world_size != 1 else param) for name, param in params.items()))
             logger.info(f"vLLM load wegiths, loaded_params: {len(loaded_params)}")
+            del params
+            torch.cuda.empty_cache()
+            self.inference_engine.wake_up(level=3)
 
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
 
-        del params
+        # del params
         log_gpu_memory_usage('After del state_dict and empty_cache in sharding manager', logger=logger)
 
         # TODO: offload FSDP model weights
