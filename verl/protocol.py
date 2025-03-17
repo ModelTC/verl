@@ -199,6 +199,13 @@ class DataProto:
         non_tensor_data = {key: val[item] for key, val in self.non_tensor_batch.items()}
         return DataProtoItem(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
 
+    def __setitem__(self, item, value: 'DataProtoItem'):
+        if not isinstance(value, DataProtoItem):
+            raise TypeError(f"Expected value to be a DataProtoItem, got {type(value)}")
+        
+        # TODO: update non_tensor_batch
+        self.batch[item] = value.batch
+
     def __getstate__(self):
         import io
         buffer = io.BytesIO()

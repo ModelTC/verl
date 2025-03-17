@@ -26,7 +26,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
-
+from verl.utils.dataset.utils import INPUT_TEMPLATE
 
 def collate_fn(data_list: list[dict]) -> dict:
     tensors = defaultdict(list)
@@ -89,7 +89,9 @@ class RLHFDataset(Dataset):
                  chat_template_func=None,
                  return_raw_chat=False,
                  truncation='error',
-                 filter_overlong_prompts=False):
+                 filter_overlong_prompts=False,
+                 template_key=None,
+                 padding_size=None):
         if not isinstance(parquet_files, (List, ListConfig)):
             parquet_files = [parquet_files]
 
@@ -108,6 +110,12 @@ class RLHFDataset(Dataset):
         self.chat_template_func = chat_template_func
         self.truncation = truncation
         self.filter_overlong_prompts = filter_overlong_prompts
+        if template_key:
+            assert template_key in INPUT_TEMPLATE
+            self.input_template = INPUT_TEMPLATE[template_key]
+        else:
+            self.input_template = None
+        self.padding_size = padding_size if padding_size is not None else self.max_prompt_length
 
         # whether to store the dataset in state_dict()
         # default not store
@@ -135,9 +143,14 @@ class RLHFDataset(Dataset):
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
-            self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
-                tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
-                                                                 axis=1)]
+            if self.input_template:
+                self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
+                    tokenizer.encode(self.input_template.format(doc[prompt_key][0]['content']))) <= self.max_prompt_length,
+                    axis=1)]
+            else:
+                self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
+                    tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                                                                     axis=1)]
 
             print(f'filter dataset len: {len(self.dataframe)}')
 
@@ -161,7 +174,13 @@ class RLHFDataset(Dataset):
 
         chat = row_dict.pop(self.prompt_key)
 
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+        if self.input_template:
+            question = chat[0]["content"]
+            prompt_with_chat_template = self.input_template.format(question)
+        else:
+            prompt_with_chat_template = self.tokenizer.apply_chat_template(
+                chat, add_generation_prompt=True, tokenize=False
+            )
 
         is_multi_modal = self.image_key in row_dict
         if is_multi_modal:  # expand image token
@@ -190,7 +209,8 @@ class RLHFDataset(Dataset):
 
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
                                                                          tokenizer=self.tokenizer,
-                                                                         max_length=self.max_prompt_length,
+                                                                        #  max_length=self.max_prompt_length,
+                                                                         max_length=self.padding_size,
                                                                          pad_token_id=self.tokenizer.pad_token_id,
                                                                          left_pad=True,
                                                                          truncation=self.truncation)
@@ -211,6 +231,7 @@ class RLHFDataset(Dataset):
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
         row_dict['raw_prompt_ids'] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        row_dict["prompt_length"] = row_dict['position_ids'].max().item() + 1
 
         # encode prompts without chat template
         if self.return_raw_chat:

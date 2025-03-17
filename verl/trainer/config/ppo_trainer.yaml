@@ -13,6 +13,7 @@ data:
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You should disable this and set `truncation='left'
   truncation: error
   image_key: images
+  template_key: null
 
 actor_rollout_ref:
   hybrid_engine: True
@@ -189,3 +190,7 @@ trainer:
   remove_previous_ckpt_in_save: False
   del_local_ckpt_after_load: False
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  partial_rollout:
+    enable: False
+    max_response_length: 2048 
+    train_num_threshold: 0.6

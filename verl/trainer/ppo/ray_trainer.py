@@ -550,7 +550,9 @@ class RayPPOTrainer(object):
                                          max_prompt_length=self.config.data.max_prompt_length,
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation=self.config.data.get('truncation', 'error'))
+                                         truncation=self.config.data.get('truncation', 'error'),
+                                         filter_overlong_prompts=self.config.data.get('filter_overlong_prompts', True),
+                                         template_key=self.config.data.get('template_key', None))
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
@@ -574,7 +576,9 @@ class RayPPOTrainer(object):
                                        max_prompt_length=self.config.data.max_prompt_length,
                                        filter_prompts=True,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation=self.config.data.get('truncation', 'error'))
+                                       truncation=self.config.data.get('truncation', 'error'),
+                                       filter_overlong_prompts=self.config.data.get('filter_overlong_prompts', True),
+                                       template_key=self.config.data.get('template_key', None))
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             # Validation datasets are sent to inference engines as a whole batch,
@@ -641,6 +645,9 @@ class RayPPOTrainer(object):
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+            test_batch = test_batch.repeat(
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
@@ -663,6 +670,7 @@ class RayPPOTrainer(object):
                 )
 
             test_gen_batch.meta_info = {
+                'n': 1,
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
                 'recompute_log_prob': False,

@@ -15,6 +15,7 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_partial_rollout_trainer import RayPPOPartialRolloutTrainer
 
 import ray
 import hydra
@@ -142,6 +143,9 @@ def main_task(config):
     elif reward_manager_name == 'prime':
         from verl.workers.reward_manager import PrimeRewardManager
         reward_manager_cls = PrimeRewardManager
+    elif reward_manager_name == 'deepscaler':
+        from verl.workers.reward_manager import DeepScalerRewardManager 
+        reward_manager_cls = DeepScalerRewardManager
     else:
         raise NotImplementedError
 
@@ -153,7 +157,11 @@ def main_task(config):
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    trainer = RayPPOTrainer(config=config,
+    if config.trainer.partial_rollout.enable:
+        ppo_trainer_cls = RayPPOPartialRolloutTrainer
+    else:
+        ppo_trainer_cls = RayPPOTrainer
+    trainer = ppo_trainer_cls(config=config,
                             tokenizer=tokenizer,
                             processor=processor,
                             role_worker_mapping=role_worker_mapping,
