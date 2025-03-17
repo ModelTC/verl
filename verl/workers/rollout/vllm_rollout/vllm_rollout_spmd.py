@@ -136,6 +136,7 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.vocab_size = len(tokenizer)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -211,6 +212,12 @@ class vLLMRollout(BaseRollout):
         for k in prompts.meta_info.keys():
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = prompts.meta_info[k]
+                
+        # Tokens with IDs exceeding the vocabulary size should be ignored.
+        def process_token(token_ids, logits):
+            logits[self.vocab_size:] = float("-inf")
+            return logits
+        kwargs['logits_processors'] = [process_token]
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
