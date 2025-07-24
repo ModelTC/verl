@@ -284,6 +284,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             warnings.simplefilter("ignore")
             if self.config.model.get("internvl", False):
                 actor_module_class = InternVLChatModel
+            elif actor_model_config.model_type == 'qwen2_5_vl':
+                from verl.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration_SP
+                actor_module_class = Qwen2_5_VLForConditionalGeneration_SP
             else:
                 if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
                     actor_module_class = AutoModelForVision2Seq
