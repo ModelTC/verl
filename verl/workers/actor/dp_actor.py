@@ -23,6 +23,8 @@ import os
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch import distributed as dist
+from tensordict import TensorDict
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -47,6 +49,21 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+def compute_avg_response_tokens(batch: list[DataProto], dp_group=None):
+    response_tokens = 0
+    for item in batch:
+        response_length = item.batch['responses'].size(1)
+        attention_mask = item.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        response_tokens += response_mask.sum()
+
+    if dist.is_initialized():
+        avg_response_tokens = torch.tensor([response_tokens], device='cuda')
+        dist.all_reduce(avg_response_tokens, op=dist.ReduceOp.AVG, group=dp_group)
+        avg_response_tokens_per_dp = avg_response_tokens.cpu().item()
+
+    return avg_response_tokens_per_dp
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -392,6 +409,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    if self.config.use_token_level_loss:
+                        avg_response_tokens_per_dp = compute_avg_response_tokens(batch=micro_batches)
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -473,8 +492,12 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
+                        if self.config.use_token_level_loss:
+                            # token mean
+                            loss = policy_loss * (response_mask.sum() / avg_response_tokens_per_dp)
+                        else:
+                            # relative to the dynamic bsz
+                            loss = policy_loss * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
