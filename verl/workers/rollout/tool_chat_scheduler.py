@@ -1,0 +1,815 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import asyncio
+import json
+import os
+from typing import Any, Dict, List
+import random
+import json
+import os
+
+import re
+import aiohttp
+
+import torch
+from openai.types.chat.chat_completion import ChatCompletion
+from tensordict import TensorDict
+
+from verl.protocol import DataProto
+from verl.workers.rollout.legacy_chat_scheduler import ChatCompletionScheduler
+from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
+from verl.single_controller.base.decorator import Dispatch, register
+from verl.utils import hf_processor, hf_tokenizer
+from verl.models.transformers.qwen2_vl import get_rope_index
+
+import io
+import base64
+import numpy as np
+from PIL import Image
+from sandbox_fusion import run_jupyter_async, RunJupyterRequest
+
+from verl.utils.dataset.rl_dataset_tool_json import process_image
+from verl.utils.dataset.utils import dynamic_preprocess_v3, build_transform, IMG_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN
+
+def repeat_each(lst, n):
+    return [x for x in lst for _ in range(n)]
+
+
+def base64_to_pil(image_base64):
+    image_data = base64.b64decode(image_base64)
+    image_io = io.BytesIO(image_data)
+    image = Image.open(image_io)
+    return image
+
+
+def pil_to_base64(image):
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")  # You can change the format if needed, e.g., "JPEG"
+    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return image_base64
+
+
+class ToolChatCompletionScheduler(ChatCompletionScheduler):
+    """
+    A very naive implementation of ChatCompletionScheduler for demo purpose,
+    only do single-turn chat completion.
+    """
+    def __init__(self, config, model_path, server_addresses, sandbox_address, data_config, max_turns=10, **kwargs):
+        super().__init__(config, model_path, server_addresses, **kwargs)
+        self.sandbox_address = sandbox_address
+        self.max_turns = max_turns
+        self.max_prompt_length = data_config.max_prompt_length
+        self.max_response_length = data_config.max_response_length
+
+        # internvl dataset config
+        try:
+            internvl_config_file = data_config['internvl_config_file']
+        except KeyError:
+            raise ValueError("`internvl_config_file` is required")
+        assert os.path.exists(internvl_config_file), f"internvl_config_file {internvl_config_file} not found"
+        internvl_config = json.load(open(internvl_config_file, 'r'))
+        self.image_size = internvl_config.get('force_image_size', None) or internvl_config['vision_config']['image_size']
+        self.pad2square = internvl_config['pad2square']
+        self.min_dynamic_patch = internvl_config['min_dynamic_patch']
+        self.max_dynamic_patch = internvl_config['max_dynamic_patch']
+        self.use_thumbnail = internvl_config['use_thumbnail']
+        patch_size = internvl_config['vision_config']['patch_size']
+        downsample_ratio = internvl_config['downsample_ratio']
+        self.num_image_token = int((self.image_size // patch_size)**2 * (downsample_ratio**2))
+
+    def message_to_token(self, message):
+        if isinstance(message['content'], str):
+            token_ids = self.tokenizer.apply_chat_template(
+                [message], add_generation_prompt=False, tokenize=True
+            )
+
+        elif isinstance(message['content'], list):
+            num_tiles = []
+            images = []
+            text = ''
+            for part in message['content']:
+                assert isinstance(part, dict), f'part: {part}'
+                if part['type'] == "image_url":
+                    image_base64 = part['image_url']['url'].split("base64,")[1]
+                    image = base64_to_pil(image_base64)
+                    image = process_image(image, max_pixels=self.max_pixels)
+                    images.append(image)
+                elif part['type'] == "text":
+                    text += part['text']
+
+            num_image = len(images)
+            for image in images:
+                patches = dynamic_preprocess_v3(
+                    image, 
+                    min_num=self.min_dynamic_patch, 
+                    # max_num=max(self.max_dynamic_patch // num_image, 1),
+                    max_num=max(self.max_dynamic_patch, 1),
+                    image_size=self.image_size, 
+                    use_thumbnail=self.use_thumbnail)
+                num_tiles.append(len(patches))
+
+            # NOTE: For now we always add <image> at the front of
+            # the prompt to consistent with vllm inference
+            text = "\n".join(['<image>'] * num_image + [text])
+            num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
+            for i in range(len(num_image_tokens)):
+                text = text.replace('<image>', f"{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_tokens[i]}{IMG_END_TOKEN}", 1)
+            
+            new_message = {'role': message['role'], 'content': text}
+            token_ids = self.tokenizer.apply_chat_template(
+                [new_message], add_generation_prompt=False, tokenize=True
+            )
+
+        return token_ids
+
+    async def sandbox_run_jupyter(self, cells: list, max_attempts: int=3, timeout: int=300):
+        """Execute python code in sandbox."""
+        if isinstance(self.sandbox_address, list):
+            sandbox_address = random.choice(self.sandbox_address)
+        elif isinstance(self.sandbox_address, str):
+            sandbox_address = self.sandbox_address
+        else:
+            raise ValueError(f"Invalid sandbox_address: {self.sandbox_address}")
+        
+        try:
+            resp = await run_jupyter_async(
+                RunJupyterRequest(cells=cells, total_timeout=300),
+                endpoint=f"http://{sandbox_address}",
+                max_attempts=max_attempts,
+                client_timeout=timeout,
+            )
+            return resp.cells[-1]
+        except Exception as e:
+            print(f"sandbox exception: {e}, {type(e)=}")
+            return
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
+        kwargs = dict(
+            n=1,
+            max_completion_tokens=self.config.response_length,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+        )
+
+        do_sample = batch.meta_info.get("do_sample", True)
+        is_validate = batch.meta_info.get("validate", False)
+        if not do_sample:
+            kwargs.update({
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
+            })
+        elif is_validate:
+            kwargs.update({
+                # "top_k": self.config.val_kwargs.top_k,
+                "top_p": self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "n": 1,  # if validate, already repeat in ray_trainer
+            })
+
+
+        kwargs.update(sampling_params)
+        print(f"[ToolChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
+
+        async def _process_response(cells, resp):
+            matches = re.findall(r"<\|action_start\|><\|interpreter\|>\n```python(.*?)```\n<\|action_end\|>\n?$", resp, re.DOTALL)
+            if not matches:
+                return
+            if len(matches) != resp.count("<|action_start|>") or len(matches) != resp.count("<|action_end|>") or len(matches) != resp.count("<|interpreter|>"):
+                return
+
+            code = matches[0].strip()
+            cells.append(code)
+            result = await self.sandbox_run_jupyter(cells)
+            if not result:
+                return
+
+            content = []
+            for res in result.display:
+                try:
+                    if "image/png" in res:
+                        image = base64_to_pil(res['image/png'])
+                        image = process_image(image, max_pixels=self.max_pixels)
+                        image_base64 = pil_to_base64(image)
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}"
+                            }
+                        })
+                    elif 'text/plain' in res:
+                        content.append({
+                            "type": "text", 
+                            "text": f"{res['text/plain']}"
+                        })
+                except Exception as e:
+                    content = str(e)
+                    break
+
+            if len(content) == 0:
+                try:
+                    trace = '\n'.join(result.error[0]['traceback'])
+                    # remove color
+                    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+                    trace = ansi_escape.sub('', trace)
+                    content = f"{trace}"
+                except:
+                    return
+
+            message = {"role": "interpreter-return", "content": content}
+            return message
+
+        async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
+            assert exception is None, f"exception: {exception}, {type(exception)=} {info['response_length']=}, {self.max_response_length=} {info['turn']=}"
+
+            batch_conversations, batch_index, cells, turn, response_length = (
+                info["batch_conversations"],
+                info["batch_index"],
+                info["cells"],
+                info["turn"],
+                info["response_length"]
+            )
+
+            assert len(completions.choices) == 1
+            choice = completions.choices[0]
+            role, content = choice.message.role, choice.message.content
+            message = {"role": role, "content": content}
+            message['token_ids'] = self.message_to_token(message)
+            batch_conversations[batch_index].append(message)
+            response_length += len(message['token_ids'])
+
+            if turn == self.max_turns or response_length > self.max_response_length:
+                return
+
+            tool_message = await _process_response(cells, content)
+            if tool_message == None:
+                return
+
+            tool_token_ids = self.message_to_token(tool_message)
+            if response_length + len(tool_token_ids) > self.max_response_length:
+                return
+
+            response_length += len(tool_token_ids)
+            tool_message['token_ids'] = tool_token_ids
+            batch_conversations[batch_index].append(tool_message)
+
+            # STEP 4: resubmit chat completions with code block output
+            extra_headers = {"x-request-id": completions.id}
+            await self.submit_chat_completions(
+                callback=callback,
+                callback_additional_info={
+                    "batch_conversations": batch_conversations,
+                    "batch_index": batch_index,
+                    "cells": cells,
+                    "turn": turn + 1,
+                    "response_length": response_length
+                },
+                model=self.model_name,
+                messages=batch_conversations[batch_index],
+                extra_headers=extra_headers,
+                **kwargs,
+            )
+
+
+        # TODO: we may need to control max concurrent requests here, or it will harm prefix cache hit rate.
+        tasks, batch_conversations = [], [None] * len(batch)
+        raw_prompts = batch.non_tensor_batch["raw_prompt"]
+
+        # For aiohttp
+        kwargs['skip_special_tokens'] = False
+
+        for batch_index, conversation in enumerate(raw_prompts):
+            conversation = conversation.tolist()
+            batch_conversations[batch_index] = conversation
+            tasks.append(
+                asyncio.create_task(
+                    self.submit_chat_completions(
+                        callback=callback,
+                        callback_additional_info={
+                            "batch_conversations": batch_conversations,
+                            "batch_index": batch_index,
+                            "cells": [],
+                            "turn": 1,
+                            "response_length": 0,
+                        },
+                        model=self.model_name,
+                        messages=conversation,
+                        **kwargs,
+                    )
+                )
+            )
+        await asyncio.gather(*tasks)
+        print("[NaiveChatCompletionScheduler] generate_sequences done")
+
+        return self._postprocess(batch, batch_conversations)
+
+    def _postprocess(self, batch: DataProto, batch_conversations) -> DataProto:
+        raw_prompts = batch.non_tensor_batch["raw_prompt"]
+
+        transform = build_transform(is_train=False, input_size=self.image_size, pad2square=False)
+        batch_resp_ids, batch_loss_mask = [], []
+        multi_modal_inputs = []
+        for prompt, convs in zip(raw_prompts, batch_conversations):
+            resp_convs = convs[len(prompt):]
+            resp_ids, loss_mask = [], []
+            whole_images = []
+
+            for message in resp_convs:
+                length = len(message['token_ids'])
+                resp_ids.extend(message['token_ids'])
+                if message['role'] == 'assistant':
+                    loss_mask.extend([1] * length)
+                elif message['role'] == 'interpreter-return':
+                    loss_mask.extend([0] * length)
+
+                if message['role'] == 'interpreter-return':
+                    if isinstance(message['content'], list):
+                        for part in message['content']:
+                            if 'image_url' in part:
+                                image_base64 = part['image_url']['url'].split("base64,")[1]
+                                image = base64_to_pil(image_base64)
+                                whole_images.append(image)
+
+            batch_resp_ids.append(resp_ids)
+            batch_loss_mask.append(loss_mask)
+
+            num_image = len(whole_images)
+            if num_image > 0:
+                images, num_tiles = [], []
+                for image in whole_images:
+                    patches = dynamic_preprocess_v3(
+                        image, 
+                        min_num=self.min_dynamic_patch, 
+                        # max_num=max(self.max_dynamic_patch // num_image, 1),
+                        max_num=max(self.max_dynamic_patch, 1),
+                        image_size=self.image_size, 
+                        use_thumbnail=self.use_thumbnail)
+                    images.extend(patches)
+                    num_tiles.append(len(patches))
+                pixel_values = [transform(image) for image in images]
+                pixel_values = torch.stack(pixel_values)
+                num_patches = pixel_values.size(0)
+                image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+                multi_modal_inputs.append({
+                    'pixel_values': pixel_values, 
+                    'image_flags': image_flags
+                })
+            else:
+                multi_modal_inputs.append({
+                    'pixel_values': torch.zeros(1, 3, self.image_size, self.image_size), 
+                    'image_flags': torch.zeros(1, dtype=torch.long)
+                })
+
+        # prompts: [prompt] from input dataset
+        prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
+        prompts = self.tokenizer(prompts, return_tensors="pt", padding="max_length", max_length=self.max_prompt_length, padding_side="left")
+
+        # flatten batch_conversations if n > 1
+        # batch_conversations = [conversation for conversations in batch_conversations for conversation in conversations]
+        assert len(batch_conversations) == len(prompts["input_ids"])
+        assert all(conversation[-1]['role'] == 'assistant' for conversation in batch_conversations)
+
+        responses_ids = pad_2d_list_to_length(batch_resp_ids, self.tokenizer.pad_token_id, max_length=self.max_response_length)
+        attention_mask = get_response_mask(response_id=responses_ids, eos_token=self.tokenizer.pad_token_id)
+        responses = {"input_ids": responses_ids, "attention_mask": attention_mask}
+
+        # clip response
+        responses["input_ids"] = responses["input_ids"][:, :self.max_response_length]
+        responses["attention_mask"] = responses["attention_mask"][:, :self.max_response_length]
+
+        input_ids = torch.cat([prompts["input_ids"], responses["input_ids"]], dim=1)
+        attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
+        position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
+
+        batch_loss_mask = pad_2d_list_to_length(batch_loss_mask, 0, self.max_response_length)
+        batch_loss_mask = batch_loss_mask[:, :self.max_response_length]
+
+        batch = TensorDict(
+            {
+                "prompts": prompts["input_ids"],
+                "responses": responses["input_ids"],
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "loss_mask": batch_loss_mask,
+            },
+            batch_size=len(input_ids),
+        )
+
+        non_tensor_batch = {
+            "multi_modal_inputs": np.array(multi_modal_inputs, dtype=object)
+        }
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+
+
+class ToolChatCompletionScheduler_QwenVL(ChatCompletionScheduler):
+    """
+    A very naive implementation of ChatCompletionScheduler for demo purpose,
+    only do single-turn chat completion.
+    """
+    def __init__(self, config, model_path, server_addresses, sandbox_address, data_config, max_turns=8, **kwargs):
+        super().__init__(config, model_path, server_addresses, **kwargs)
+        self.sandbox_address = sandbox_address
+        self.max_turns = max_turns
+        self.max_prompt_length = data_config.max_prompt_length
+        self.max_response_length = data_config.max_response_length
+        self.max_pixels = getattr(data_config, 'max_pixels', 1024 * 1024)
+
+        self.processor = hf_processor(model_path, use_fast=True)
+
+    def message_to_token(self, message):
+        if isinstance(message['content'], str):
+            token_ids = self.tokenizer.apply_chat_template(
+                [message], add_generation_prompt=False, tokenize=True
+            )
+
+        elif isinstance(message['content'], list):
+            images = []
+            text = ''
+
+            # collect image and text
+            for part in message['content']:
+                assert isinstance(part, dict), f'part: {part}'
+                if part['type'] == "image_url":
+                    image_base64 = part['image_url']['url'].split("base64,")[1]
+                    image = base64_to_pil(image_base64)
+                    images.append(image)
+                elif part['type'] == "text":
+                    text += part['text']
+
+            # process image to determine image tokens
+            num_image = len(images)
+            if num_image > 0:
+                image_inputs = self.processor.image_processor(images, return_tensors='pt')
+                image_grid_thw = image_inputs['image_grid_thw']
+                merge_length = self.processor.image_processor.merge_size**2
+                index = 0
+                while '<image>' in text:
+                    text = text.replace(
+                        '<image>',
+                        '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) +
+                        '<|vision_end|>',
+                        1,
+                    )
+                    index += 1
+                text = text.replace('<|placeholder|>', self.processor.image_token)
+            
+            # form token ids
+            new_message = {'role': message['role'], 'content': text}
+            token_ids = self.tokenizer.apply_chat_template(
+                [new_message], add_generation_prompt=False, tokenize=True
+            )
+
+        return token_ids
+
+    async def sandbox_run_jupyter(self, cells: list, max_attempts: int=3, timeout: int=300):
+        """Execute python code in sandbox."""
+        if isinstance(self.sandbox_address, list):
+            sandbox_address = random.choice(self.sandbox_address)
+        elif isinstance(self.sandbox_address, str):
+            sandbox_address = self.sandbox_address
+        else:
+            raise ValueError(f"Invalid sandbox_address: {self.sandbox_address}")
+        
+        try:
+            resp = await run_jupyter_async(
+                RunJupyterRequest(cells=cells, total_timeout=timeout),
+                endpoint=f"http://{sandbox_address}",
+                max_attempts=max_attempts,
+                client_timeout=timeout+30,
+            )
+            return resp.cells[-1]
+        except Exception as e:
+            print(f"sandbox exception: {e}, {type(e)=}")
+            return
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
+
+        # 1. set sampling params
+        kwargs = dict(
+            n=1,
+            max_completion_tokens=self.config.response_length,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+        )
+
+        do_sample = batch.meta_info.get("do_sample", True)
+        is_validate = batch.meta_info.get("validate", False)
+        if not do_sample:
+            kwargs.update({
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
+            })
+        elif is_validate:
+            kwargs.update({
+                # "top_k": self.config.val_kwargs.top_k,
+                "top_p": self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "n": 1,  # if validate, already repeat in ray_trainer
+            })
+
+        kwargs.update(sampling_params)
+        print(f"[ToolChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
+
+
+        # 2. helper functions
+        async def _process_response(cells, resp):
+            # === 1. 提取并验证工具调用 ===
+            
+            # 1.1 必须且只能找到一个 tool_call 块
+            tool_calls = re.findall(r"<tool_call>\n(.*?)\n</tool_call>$", resp, re.DOTALL)
+            if len(tool_calls) != 1 or resp.count("<tool_call>") != 1 or resp.count("</tool_call>") != 1:
+                return
+
+            # 1.2 tool_call 内容必须是合法的 JSON
+            try:
+                tool_call = json.loads(tool_calls[0])
+            except json.JSONDecodeError:
+                return
+
+            # 1.3 tool_call 结构必须符合规范
+            if not isinstance(tool_call, dict) or \
+            'name' not in tool_call or \
+            'arguments' not in tool_call or \
+            len(tool_call.keys()) != 2:
+                return
+
+            # 1.4 目前只支持 'python' 工具
+            if tool_call.get('name') != 'python':
+                return
+
+            code = tool_call.get('arguments', {}).get('code')
+            if not code:
+                return
+
+            # === 2. 执行代码并获取结果 ===
+            cells.append(code)
+            result = await self.sandbox_run_jupyter(cells)
+            if not result:
+                return
+
+            # === 3. 处理执行结果，构建 content (核心优化部分) ===
+            # 采用更清晰的 if/elif/else 结构，一次性构建好最终的 content
+            
+            content = []
+            
+            # 情况一：执行成功，有输出（stdout 或 display 数据）
+            if result.stdout or result.display:
+                texts = []
+                images = []
+                
+                if result.stdout:
+                    texts.append(result.stdout)
+                    
+                for item in result.display:
+                    try:
+                        if "image/png" in item:
+                            # 图像处理逻辑
+                            image = base64_to_pil(item['image/png'])
+                            image = process_image(image, max_pixels=self.max_pixels)
+                            image_base64 = pil_to_base64(image)
+                            
+                            images.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                            })
+                            texts.append("<image>")
+                        if 'text/plain' in item:
+                            texts.append(item['text/plain'])
+                    except Exception as e:
+                        # 如果单个 display item 处理失败，跳过它，而不是中断整个流程
+                        continue
+                
+                # 将收集到的文本和图片组装成最终的 content 格式
+                if texts:
+                    texts.insert(0, '<tool_response>')
+                    texts.append('</tool_response>')
+                    content.append({"type": "text", "text": '\n'.join(texts).strip()})
+                if images:
+                    content.extend(images)
+
+            # 情况二：执行出错
+            elif result.error and isinstance(result.error, list) and result.error:
+                try:
+                    trace = '\n'.join(result.error[0].get('traceback', []))
+                    # 移除 ANSI 颜色代码
+                    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+                    clean_trace = ansi_escape.sub('', trace)
+                    content = [{"type": "text", "text": clean_trace}]
+                except (TypeError, AttributeError):
+                    # 如果错误格式不规范，返回一个通用错误信息
+                    content = [{"type": "text", "text": "[An unknown error occurred during execution.]"}]
+            
+            # 情况三：执行成功，但没有任何输出
+            else:
+                content = [{"type": "text", "text": "[Execution completed with no output.]"}]
+
+            # === 4. 返回最终消息 ===
+            if not content:
+                return
+                
+            
+            message = {"role": "user", "content": content}
+            return message
+
+        async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
+            assert exception is None, f"exception: {exception}, {type(exception)=} {info['response_length']=}, {self.max_response_length=} {info['turn']=}"
+
+            batch_conversations, batch_index, cells, turn, response_length = (
+                info["batch_conversations"],
+                info["batch_index"],
+                info["cells"],
+                info["turn"],
+                info["response_length"]
+            )
+
+            assert len(completions.choices) == 1
+            choice = completions.choices[0]
+            role, content = choice.message.role, choice.message.content
+            if role == 'assistant':
+                content = "<think>\n" + content
+            message = {"role": role, "content": content}
+            message['token_ids'] = self.message_to_token(message)
+            batch_conversations[batch_index].append(message)
+            response_length += len(message['token_ids'])
+
+            if turn == self.max_turns or response_length > self.max_response_length:
+                return
+
+            tool_message = await _process_response(cells, content)
+            if tool_message == None:
+                return
+
+            tool_token_ids = self.message_to_token(tool_message)
+            if response_length + len(tool_token_ids) > self.max_response_length:
+                return
+
+            response_length += len(tool_token_ids)
+            tool_message['token_ids'] = tool_token_ids
+            batch_conversations[batch_index].append(tool_message)
+
+            # STEP 4: resubmit chat completions with code block output
+            extra_headers = {"x-request-id": completions.id}
+            await self.submit_chat_completions(
+                callback=callback,
+                callback_additional_info={
+                    "batch_conversations": batch_conversations,
+                    "batch_index": batch_index,
+                    "cells": cells,
+                    "turn": turn + 1,
+                    "response_length": response_length
+                },
+                model=self.model_name,
+                messages=batch_conversations[batch_index],
+                extra_headers=extra_headers,
+                **kwargs,
+            )
+
+
+        # 3. generate sequences
+        # TODO: we may need to control max concurrent requests here, or it will harm prefix cache hit rate.
+        tasks, batch_conversations = [], [None] * len(batch)
+        raw_prompts = batch.non_tensor_batch["raw_prompt"]
+
+        # For aiohttp
+        kwargs['skip_special_tokens'] = False
+
+        for batch_index, conversation in enumerate(raw_prompts):
+            conversation = conversation.tolist()
+            batch_conversations[batch_index] = conversation
+            tasks.append(
+                asyncio.create_task(
+                    self.submit_chat_completions(
+                        callback=callback,
+                        callback_additional_info={
+                            "batch_conversations": batch_conversations,
+                            "batch_index": batch_index,
+                            "cells": [],
+                            "turn": 1,
+                            "response_length": 0,
+                        },
+                        model=self.model_name,
+                        messages=conversation,
+                        **kwargs,
+                    )
+                )
+            )
+        await asyncio.gather(*tasks)
+        print("[NaiveChatCompletionScheduler] generate_sequences done")
+
+        # 4. postprocess
+        return self._postprocess(batch, batch_conversations)
+
+    def _postprocess(self, batch: DataProto, batch_conversations) -> DataProto:
+        raw_prompts = batch.non_tensor_batch["raw_prompt"]
+
+
+        batch_resp_ids, batch_loss_mask = [], []
+        multi_modal_inputs = []
+        # 1. 遍历每个 prompt 和对应的 conversation
+        for prompt, convs in zip(raw_prompts, batch_conversations):
+            resp_convs = convs[len(prompt):]
+            resp_ids, loss_mask = [], []
+            whole_images = []
+
+            # 1.1 process token ids
+            for message in resp_convs:
+                length = len(message['token_ids'])
+                resp_ids.extend(message['token_ids'])
+                if message['role'] == 'assistant':
+                    loss_mask.extend([1] * length)
+                else:
+                    loss_mask.extend([0] * length)
+
+                if isinstance(message['content'], list):
+                    for part in message['content']:
+                        if 'image_url' in part:
+                            image_base64 = part['image_url']['url'].split("base64,")[1]
+                            image = base64_to_pil(image_base64)
+                            whole_images.append(image)
+
+            batch_resp_ids.append(resp_ids)
+            batch_loss_mask.append(loss_mask)
+
+            # 1.2 process images
+            has_image = len(whole_images) > 0
+            if not has_image:
+                whole_images = [Image.new('RGB', (28, 28), (255, 255, 255))]
+
+            image_inputs = self.processor.image_processor(whole_images, return_tensors='pt')
+            image_inputs['image_flags'] = torch.tensor([1] * image_inputs['pixel_values'].size(0), dtype=torch.long) * int(has_image)
+            multi_modal_inputs.append(dict(image_inputs))
+
+
+        # 2. tokenize prompts
+        # prompts: [prompt] from input dataset
+        prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
+        prompts = self.tokenizer(prompts, return_tensors="pt", padding="max_length", max_length=self.max_prompt_length, padding_side="left")
+
+        # 3. construct data
+        assert len(batch_conversations) == len(prompts["input_ids"])
+        assert all(conversation[-1]['role'] == 'assistant' for conversation in batch_conversations)
+
+        # 3.1 construct responses
+        responses_ids = pad_2d_list_to_length(batch_resp_ids, self.tokenizer.pad_token_id, max_length=self.max_response_length)
+        attention_mask = get_response_mask(response_id=responses_ids, eos_token=self.tokenizer.pad_token_id)
+        responses = {"input_ids": responses_ids, "attention_mask": attention_mask}
+
+        # 3.2 clip response
+        responses["input_ids"] = responses["input_ids"][:, :self.max_response_length]
+        responses["attention_mask"] = responses["attention_mask"][:, :self.max_response_length]
+
+        input_ids = torch.cat([prompts["input_ids"], responses["input_ids"]], dim=1)
+        attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
+        position_ids = torch.stack([get_rope_index(
+            self.processor,
+            input_ids=input_ids[i],
+            image_grid_thw=multi_modal_inputs[i]['image_grid_thw'],
+            attention_mask=attention_mask[i],
+        ) for i in range(len(input_ids))])
+
+        # 3.3 construct loss mask
+        batch_loss_mask = pad_2d_list_to_length(batch_loss_mask, 0, self.max_response_length)
+        batch_loss_mask = batch_loss_mask[:, :self.max_response_length]
+
+
+        batch = TensorDict(
+            {
+                "prompts": prompts["input_ids"],
+                "responses": responses["input_ids"],
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "loss_mask": batch_loss_mask,
+            },
+            batch_size=len(input_ids),
+        )
+
+
+        non_tensor_batch = {
+            "multi_modal_inputs": np.array(multi_modal_inputs, dtype=object)
+        }
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)

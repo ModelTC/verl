@@ -4,6 +4,11 @@ name: vllm
 # sync: LLM, async: AsyncLLM
 mode: sync
 
+# async chat scheduler, e.g examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler
+chat_scheduler: null
+chat_scheduler_kwargs: { }
+chat_scheduler_num: 1
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

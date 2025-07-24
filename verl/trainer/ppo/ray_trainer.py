@@ -384,6 +384,10 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        self.scheduler_kwargs = OmegaConf.to_container(self.config.actor_rollout_ref.rollout.get("chat_scheduler_kwargs", OmegaConf.create()))
+        if self.scheduler_kwargs.pop('use_data_config', False):
+            self.scheduler_kwargs['data_config'] = self.config.data
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -689,7 +693,10 @@ class RayPPOTrainer:
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                # test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                self.async_rollout_manager.wake_up()
+                test_output_gen_batch_padded = self.chat_scheduler_wg.generate_sequences(test_gen_batch_padded)
+                self.async_rollout_manager.sleep()
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -866,13 +873,41 @@ class RayPPOTrainer:
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from verl.experimental.agent_loop import AgentLoopManager
+            # from verl.experimental.agent_loop import AgentLoopManager
 
+            # self.async_rollout_mode = True
+            # self.async_rollout_manager = AgentLoopManager(
+            #     config=self.config,
+            #     worker_group=self.actor_rollout_wg,
+            # )
+
+            from verl.workers.rollout.async_server import AsyncLLMServerManager
             self.async_rollout_mode = True
-            self.async_rollout_manager = AgentLoopManager(
+            self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+
+            import importlib
+            chat_scheduler_num = self.config.actor_rollout_ref.rollout.chat_scheduler_num
+            server_addresses = self.async_rollout_manager.server_addresses 
+            assert self.config.data.train_batch_size % self.config.actor_rollout_ref.rollout.chat_scheduler_num == 0 
+            assert chat_scheduler_num % len(server_addresses) == 0 or len(server_addresses) % chat_scheduler_num == 0
+
+            module_path, class_name = self.config.actor_rollout_ref.rollout.chat_scheduler.rsplit(".", 1)
+            module = importlib.import_module(module_path)
+            scheduler_cls = getattr(module, class_name)
+            resource_pool = RayResourcePool(
+                [chat_scheduler_num], use_gpu=False, max_colocate_count=1
+            )
+            cls_with_args = RayClassWithInitArgs(
+                cls=ray.remote(scheduler_cls), 
+                config=self.config.actor_rollout_ref.rollout,
+                model_path=self.config.actor_rollout_ref.model.path,
+                server_addresses=server_addresses,
+                **self.scheduler_kwargs
+            )
+            self.chat_scheduler_wg = RayWorkerGroup(resource_pool, cls_with_args)
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1117,8 +1152,11 @@ class RayPPOTrainer:
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                            # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            self.async_rollout_manager.wake_up()
+                            gen_batch_output = self.chat_scheduler_wg.generate_sequences(gen_batch)
+                            self.async_rollout_manager.sleep()
+                        # timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
