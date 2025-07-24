@@ -251,9 +251,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
-        )
+        if self.config.model.get("internvl", False):
+            from verl.models.internvl import InternVLChatConfig, InternVLChatModel
+            actor_model_config = InternVLChatConfig.from_pretrained(local_path)
+        else:
+            actor_model_config = AutoConfig.from_pretrained(
+                local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            )
 
         # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
@@ -278,10 +282,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                actor_module_class = AutoModelForVision2Seq
+            if self.config.model.get("internvl", False):
+                actor_module_class = InternVLChatModel
             else:
-                actor_module_class = AutoModelForCausalLM
+                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                    actor_module_class = AutoModelForVision2Seq
+                else:
+                    actor_module_class = AutoModelForCausalLM
 
             actor_module = actor_module_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
@@ -289,6 +296,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
             )
+
+            for key, value in self.config.model.get('custom_kwargs', {}).items():
+                setattr(actor_module, key, value)
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
