@@ -687,7 +687,8 @@ class RayPPOTrainer:
             size_divisor = (
                 self.actor_rollout_wg.world_size
                 if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
+                else self.config.actor_rollout_ref.rollout.chat_scheduler_num
+                # else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             if not self.async_rollout_mode:

@@ -406,7 +406,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
-                "loss_mask": batch_loss_mask,
+                "response_mask": batch_loss_mask,
             },
             batch_size=len(input_ids),
         )
@@ -802,7 +802,7 @@ class ToolChatCompletionScheduler_QwenVL(ChatCompletionScheduler):
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
-                "loss_mask": batch_loss_mask,
+                "response_mask": batch_loss_mask,
             },
             batch_size=len(input_ids),
         )
