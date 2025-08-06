@@ -214,8 +214,18 @@ def reduce_timing(timing_raw: dict[str, float]) -> dict[str, float]:
     for key in sorted(timing_raw.keys()):
         key_list.append(key)
         timing_list.append(timing_raw[key])
-    timing_list = torch.tensor(timing_list, dtype=torch.float32, device=get_device_id())
-    torch.distributed.all_reduce(timing_list, op=torch.distributed.ReduceOp.AVG)
-    timing_list = [tensor.item() for tensor in timing_list.to("cpu")]
-    timing_generate = {key_list[i]: timing_list[i] for i in range(len(key_list))}
-    return timing_generate
+        
+    timing_tensor = torch.tensor(timing_list, dtype=torch.float32, device=get_device_id())
+    world_size = torch.distributed.get_world_size()
+    gathered = [torch.zeros_like(timing_tensor) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, timing_tensor)
+    timing_mat = torch.stack(gathered).cpu()
+    result = {}
+    for i, key in enumerate(key_list):
+        arr = timing_mat[:, i]
+        result[f"{key}_ave"] = float(arr.mean().item())
+        result[f"{key}_min"] = float(arr.min().item())
+        result[f"{key}_max"] = float(arr.max().item())
+        result[f"{key}_std"] = float(arr.std().item())
+    return result
+
