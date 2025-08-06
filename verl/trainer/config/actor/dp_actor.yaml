@@ -32,6 +32,9 @@ entropy_from_logits_with_chunking: False
 # recompute entropy
 entropy_checkpointing: False
 
+# Whether to use token-level loss, take effect only when use_dynamic_bsz is true
+use_token_level_loss: false
+
 # optimizer configs
 optim:
 
