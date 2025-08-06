@@ -18,11 +18,12 @@ This file contains a Megatron style Hybrid Engine that shares the weights of the
 import inspect
 import logging
 import os
+from copy import deepcopy
 
 import torch
 import torch.distributed
 from megatron.core import parallel_state as mpu
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from verl import DataProto
@@ -139,6 +140,14 @@ class MegatronVLLMShardingManager(BaseShardingManager):
             get_torch_device().set_rng_state(self.torch_random_states)
         else:
             self.gen_random_states = None
+        engine_kwargs = (
+            {}
+            if "engine_kwargs" not in rollout_config or "vllm" not in rollout_config.engine_kwargs
+            else OmegaConf.to_container(deepcopy(rollout_config.engine_kwargs.vllm))
+        )
+        self.fp8 = False
+        if 'quantization' in engine_kwargs and engine_kwargs['quantization'] == 'fp8':
+            self.fp8 = True
 
     @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=logger)
     def __enter__(self):
@@ -167,7 +176,11 @@ class MegatronVLLMShardingManager(BaseShardingManager):
                 )
             model = self.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            loaded_params = model.load_weights(per_tensor_param)
+            if self.fp8:
+                from verl.workers.sharding_manager.fp8_weight_convert import weight_fuse_and_quantize_generator
+                loaded_params = model.load_weights(weight_fuse_and_quantize_generator(per_tensor_param))
+            else:
+                loaded_params = model.load_weights(per_tensor_param)
             info = f"vLLM load weights, loaded_params: {len(loaded_params)}"
             logger.info(info)
 
