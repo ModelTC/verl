@@ -14,11 +14,12 @@
 import logging
 import os
 import pickle
+from copy import deepcopy
 from typing import Any, Callable, Optional
 
 import ray
 import zmq
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from vllm import SamplingParams
@@ -241,6 +242,23 @@ class AsyncvLLMServer(AsyncServerBase):
         else:
             distributed_executor_backend = None
 
+        lora_kwargs = kwargs.pop("lora_kwargs", {})
+        self.lora_kwargs = lora_kwargs
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = (
+            {}
+            if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs
+            else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        )
+        # For each vLLM engine parameter,
+        # - `None` means not setting it, so we pop it, and leave it to vLLM default value
+        #    (which can vary across different vLLM versions);
+        # - Otherwise it's the desired value we want to explicitly set.
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        if config.get("limit_images", None):  # support for multi-image data
+            engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
+
+
         engine_args = AsyncEngineArgs(
             model=local_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -253,13 +271,15 @@ class AsyncvLLMServer(AsyncServerBase):
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=self.max_model_len,
-            load_format="auto",
+            load_format="dummy",
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            **lora_kwargs,
+            **engine_kwargs,
         )
 
         # init async llm engine
