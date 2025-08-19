@@ -1201,16 +1201,21 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    reward_batch = batch.select(batch_keys=["prompts", "responses", "attention_mask"], non_tensor_batch_keys=["reward_model"])
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            reward_tensor = self.rm_wg.compute_rm_score(reward_batch)
                             batch = batch.union(reward_tensor)
 
                         if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            assert len(reward_batch) % self.config.reward_model.reward_fn_parallel_size == 0
+                            reward_futures = [
+                                compute_reward_async.remote(data, self.config, self.tokenizer) 
+                                    for data in reward_batch.chunk(self.config.reward_model.reward_fn_parallel_size)
+                            ]
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(reward_batch, self.reward_fn)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1267,7 +1272,18 @@ class RayPPOTrainer:
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            reward_tensor_list = []
+                            reward_extra_infos_dict = defaultdict(list)
+                            reward_results = ray.get(reward_futures)
+                            key2len = {}
+                            for _, extra_infos in reward_results:
+                                for k, v in extra_infos.items():
+                                    key2len.setdefault(k, len(v)) 
+                            for (reward_t, extra_infos) in reward_results:
+                                reward_tensor_list.append(reward_t)
+                                for k, pad_len in key2len.items():
+                                    reward_extra_infos_dict[k].extend(extra_infos.get(k, [None] * pad_len))
+                            reward_tensor = torch.cat(reward_tensor_list, dim=0)
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
