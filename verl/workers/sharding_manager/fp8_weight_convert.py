@@ -115,6 +115,10 @@ def weight_fuse_and_quantize_generator(updatad_params):
     ]
 
     for name, param in updatad_params:
+        
+        if "vision_model" in name:
+            yield name, param
+            continue
 
         if '.experts.' in name:
             if name.endswith("proj.weight"): # for gate, up, down

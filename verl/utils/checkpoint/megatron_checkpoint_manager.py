@@ -146,7 +146,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         self.use_dist_checkpointing = use_dist_checkpointing or not self.bridge or self.is_value_model
         self.use_hf_checkpoint = not self.use_dist_checkpointing
 
-        self.weight_saver = get_weight_saver(self.arch)
+        if self.should_save_hf_model:
+            self.weight_saver = get_weight_saver(self.arch)
+        else:
+            self.weight_saver = None
 
     def get_rng_state(self, use_dist_ckpt: bool = True, data_parallel_random_init: bool = False):
         """collect rng state across data parallel ranks"""
@@ -385,11 +388,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         for vpp_rank, model in enumerate(self.model):
             if len(self.model) > 1:
                 model_i_keys = state_dict[f"model{vpp_rank}"].keys()
-                log_with_rank(f"Generated state dict for saving: {model_i_keys}", rank=self.rank, logger=logger)
+                # log_with_rank(f"Generated state dict for saving: {model_i_keys}", rank=self.rank, logger=logger)
             else:
-                log_with_rank(
-                    f"Generated state dict for saving: {state_dict['model'].keys()}", rank=self.rank, logger=logger
-                )
+                # log_with_rank(
+                #     f"Generated state dict for saving: {state_dict['model'].keys()}", rank=self.rank, logger=logger
+                # )
+                pass
         # Start Async save if enabled
         async_save_request = save_dist_checkpointing(
             sharded_state_dict=state_dict,

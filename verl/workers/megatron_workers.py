@@ -174,7 +174,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.config.model.get("trust_remote_code", False),
             self.config.actor.megatron.use_mbridge,
         )
-        self.generation_config = get_generation_config(self.local_path)
+        self.generation_config = get_generation_config(self.local_path, trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         override_ddp_config = OmegaConf.to_container(
             OmegaConf.create(self.config.actor.megatron.get("override_ddp_config", {}))
@@ -316,7 +316,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # perform weight resharding between actor and rollout
             from verl.models.mcore import get_mcore_weight_converter
 
-            weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
+            if self.bridge is not None:
+                weight_converter = None
+            else:
+                weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
             sharding_manager = MegatronVLLMShardingManager(
                 inference_engine=rollout.inference_engine,
                 model_config=self.actor_model_config,

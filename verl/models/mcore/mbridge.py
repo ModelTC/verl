@@ -16,6 +16,7 @@
 try:
     from mbridge import AutoBridge
     from mbridge.utils.post_creation_callbacks import freeze_moe_router, make_value_model
+    from verl.models.mcore.intern_vl.mbridge import InternVLBridge
 except ImportError:
     print("mbridge package not found. Please install mbridge with `pip install verl[mcore]` or `pip install mbridge`")
     raise

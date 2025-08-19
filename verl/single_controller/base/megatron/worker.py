@@ -89,7 +89,6 @@ class MegatronWorker(Worker):
         self.architectures = getattr(hf_config, "architectures", None)
         if self.rank == 0:
             print(f"Model config after override: {hf_config}")
-        tf_config = hf_to_mcore_config(hf_config, dtype, **override_transformer_config)
 
         if use_mbridge:
             from verl.models.mcore.mbridge import AutoBridge
@@ -99,6 +98,7 @@ class MegatronWorker(Worker):
             tf_config = bridge.config
             self.bridge = bridge
         else:
+            tf_config = hf_to_mcore_config(hf_config, dtype, **override_transformer_config)
             self.bridge = None
 
         print(f"TF config: {tf_config}")

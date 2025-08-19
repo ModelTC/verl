@@ -662,6 +662,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype, device='cuda')
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype, device='cuda')
 
+            w13_weight_loader = layer.w13_weight.weight_loader
+            w2_weight_loader = layer.w2_weight.weight_loader
+
             # Re-initialize w13_scale because we directly quantize
             # merged w13 weights and generate a single scaling factor.
             layer.w13_weight_scale = torch.nn.Parameter(torch.ones(
@@ -675,11 +678,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             for expert in range(layer.local_num_experts):
                 w13_weight[expert, :, :], layer.w13_weight_scale[expert, :, :] = ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :].cuda(), use_per_token_if_dynamic=cutlass_fp8_supported())
                 w2_weight[expert, :, :], layer.w2_weight_scale[expert, :, :] = ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :].cuda(), use_per_token_if_dynamic=cutlass_fp8_supported())
-            
+
             setattr(layer.w13_weight_scale, 'quant_method', 'channel')
             setattr(layer.w2_weight_scale, 'quant_method', 'channel')
 
-            print('!!!! vllm fp8 moe use per channel !!!!')
+            setattr(layer.w13_weight_scale, 'weight_loader', w13_weight_loader)
+            setattr(layer.w2_weight_scale, 'weight_loader', w2_weight_loader)
 
             from vllm.model_executor.layers.fused_moe import fused_experts
             self.fused_experts = functools.partial(  # type: ignore
@@ -688,11 +692,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 allow_deep_gemm=self.allow_deep_gemm,
                 per_channel_quant=True,
                 )
-            
+
             layer.w13_weight = torch.nn.Parameter(w13_weight,
                                                   requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight,
                                                  requires_grad=False)
+
+            setattr(layer.w13_weight, 'weight_loader', w13_weight_loader)
+            setattr(layer.w2_weight, 'weight_loader', w2_weight_loader)
+
             if self.rocm_aiter_moe_enabled:
                 # reshaping weights is required for aiter moe kernel.
                 shuffled_w13, shuffled_w2 = shuffle_weights(

@@ -36,6 +36,7 @@ from .config_converter import (
 from .model_forward import (
     gptmodel_forward,
     gptmodel_forward_qwen2_5_vl,
+    gptmodel_forward_intern_vl,
 )
 from .model_forward_fused import (
     fused_forward_gptmodel,
@@ -70,6 +71,7 @@ class SupportedModel(Enum):
     LLAMA4 = "Llama4ForConditionalGeneration"  # not tested
     QWEN3 = "Qwen3ForCausalLM"  # tested
     QWEN3_MOE = "Qwen3MoeForCausalLM"  # not tested
+    INTERN_VL = "InternVLChatModel"  # not tested
 
 
 # Registry for model configuration converters
@@ -113,6 +115,7 @@ MODEL_FORWARD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.QWEN3_MOE: gptmodel_forward,
     SupportedModel.QWEN2_5_VL: gptmodel_forward_qwen2_5_vl,
     SupportedModel.DEEPSEEK_V3: gptmodel_forward,
+    SupportedModel.INTERN_VL: gptmodel_forward_intern_vl,
 }
 
 # Registry for model forward functions

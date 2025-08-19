@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import torch
 
 from verl.utils.megatron_utils import unwrap_model
 
@@ -67,6 +68,92 @@ def gptmodel_forward(
             input_ids, attention_mask, position_ids, sequence_parallel, pre_process=pre_process
         )
         output = model(input_ids=new_input_ids, attention_mask=new_attention_mask, position_ids=new_position_ids)
+        output = recover_left_padding(
+            output, new_attention_mask, attention_mask, sequence_length, post_process=post_process
+        )
+    if value_model and post_process:
+        output = output[..., 0]
+    return output
+
+
+def gptmodel_forward_intern_vl(
+    model,
+    input_ids,
+    attention_mask,
+    position_ids,
+    sequence_parallel,
+    value_model=False,
+    pack_seqs=True,
+    multi_modal_inputs=None,
+    logits_processor=None,
+    logits_processor_args: dict = None,
+    **kwargs,
+):
+    from megatron.core import parallel_state as mpu
+
+    pre_process = unwrap_model(model).pre_process
+    post_process = unwrap_model(model).post_process
+    pixel_values = (
+        multi_modal_inputs["pixel_values"].to(input_ids.device) if "pixel_values" in multi_modal_inputs else None
+    )
+    image_flags = (
+        multi_modal_inputs["image_flags"].to(input_ids.device) if "image_flags" in multi_modal_inputs else None
+    )
+    try:
+        img_context_token_id = unwrap_model(model).img_context_token_id
+    except:
+        img_context_token_id = multi_modal_inputs["img_context_token_id"][0].item() if "img_context_token_id" in multi_modal_inputs else None
+    
+    if pack_seqs:
+        batch_size, seq_len = attention_mask.shape[:2]
+        input_ids_clone = input_ids.clone()
+        img_idx = torch.arange((input_ids_clone == img_context_token_id).sum()).to(dtype=input_ids_clone.dtype, device=input_ids_clone.device)
+        img_token_idxs = input_ids_clone == img_context_token_id
+        input_ids_clone[img_token_idxs] = img_idx
+        img_token_idxs_rmpad, _ = preprocess_packed_seqs(input_ids_clone, attention_mask, pre_process=True)
+        input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+        position_ids_rmpad, _ = preprocess_packed_seqs(position_ids, attention_mask, pre_process=True)
+        input_ids_rmpad = input_ids_rmpad.contiguous()
+        position_ids_rmpad = position_ids_rmpad.contiguous()
+        img_token_idxs_rmpad = img_token_idxs_rmpad.contiguous()
+        output_orig = model(
+            input_ids=input_ids_rmpad,
+            attention_mask=None,
+            position_ids=position_ids_rmpad,
+            packed_seq_params=packed_seq_params,
+            pixel_values=pixel_values,
+            image_flags=image_flags,
+            img_token_idxs=img_token_idxs_rmpad,
+        )
+
+        if post_process and logits_processor is not None:
+            args = {
+                k: preprocess_packed_seqs(v, attention_mask, pre_process=True)[0]
+                for k, v in logits_processor_args.items()
+            }
+            output_dict = logits_processor(output_orig, **args)
+            output = {
+                k: postprocess_packed_seqs(
+                    v, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+                )
+                for k, v in output_dict.items()
+            }
+        else:
+            output = postprocess_packed_seqs(
+                output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+            )
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
+            input_ids, attention_mask, position_ids, sequence_parallel, pre_process=pre_process
+        )
+        output = model(
+            input_ids=new_input_ids,
+            position_ids=new_position_ids,
+            attention_mask=new_attention_mask,
+            pixel_values=pixel_values,
+            image_flags=image_flags,
+        )
         output = recover_left_padding(
             output, new_attention_mask, attention_mask, sequence_length, post_process=post_process
         )
