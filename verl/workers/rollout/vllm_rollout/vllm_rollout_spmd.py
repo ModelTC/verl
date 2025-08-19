@@ -196,6 +196,13 @@ class vLLMRollout(BaseRollout):
 
         kwargs["detokenize"] = False
 
+        # skip invalid tokens generated in rollout
+        invalid_token_ids = getattr(config, "invalid_token_ids", [])
+        if len(invalid_token_ids) > 0:
+            kwargs["logit_bias"] = {}
+            for token in invalid_token_ids:
+                kwargs["logit_bias"][int(token)] = float("-inf")
+
         # supporting adding any sampling params from the config file
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)) and k != "seed":

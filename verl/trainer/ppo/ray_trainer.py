@@ -577,7 +577,8 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, scores, gts, reward_extra_infos_dict, dump_path):
+        from verl.utils.dataset.utils import IMG_CONTEXT_TOKEN, PAD_TOKEN, IMG_CONTEXT_TOKEN_QWEN
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -587,6 +588,7 @@ class RayPPOTrainer:
             "input": inputs,
             "output": outputs,
             "score": scores,
+            "gt": gts,
             "step": [self.global_steps] * n,
         }
 
@@ -596,7 +598,7 @@ class RayPPOTrainer:
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
+            entry = {k: v[i].replace(IMG_CONTEXT_TOKEN, '').replace(PAD_TOKEN, '').replace(IMG_CONTEXT_TOKEN_QWEN, '') if isinstance(v[i], str) else v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
@@ -637,6 +639,8 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
         sample_turns = []
+        sample_indices = []
+        sample_gts = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -655,6 +659,7 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+            sample_indices.extend(test_batch.non_tensor_batch['index'])
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -688,7 +693,6 @@ class RayPPOTrainer:
                 self.actor_rollout_wg.world_size
                 if not self.async_rollout_mode
                 else self.config.actor_rollout_ref.rollout.chat_scheduler_num
-                # else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             if not self.async_rollout_mode:
@@ -706,7 +710,7 @@ class RayPPOTrainer:
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
@@ -719,6 +723,8 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            gts = [x['ground_truth'] for x in test_batch.non_tensor_batch["reward_model"]]
+            sample_gts.extend(gts)
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
@@ -742,6 +748,7 @@ class RayPPOTrainer:
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 scores=sample_scores,
+                gts=sample_gts,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
             )
@@ -751,23 +758,39 @@ class RayPPOTrainer:
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        # data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        # metric_dict = {}
+        # for data_source, var2metric2val in data_src2var2metric2val.items():
+        #     core_var = "acc" if "acc" in var2metric2val else "reward"
+        #     for var_name, metric2val in var2metric2val.items():
+        #         n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+        #         for metric_name, metric_val in metric2val.items():
+        #             if (
+        #                 (var_name == core_var)
+        #                 and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+        #                 and (f"@{n_max}" in metric_name)
+        #             ):
+        #                 metric_sec = "val-core"
+        #             else:
+        #                 metric_sec = "val-aux"
+        #             pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+        #             metric_dict[pfx] = metric_val
+        data_source_reward = defaultdict(list)
+        data_source_index_reward = defaultdict(lambda: defaultdict(list))
+
+        for ds, sample_idx, reward in zip(data_sources, sample_indices, sample_scores):
+            data_source_reward[ds].append(reward)
+            data_source_index_reward[ds][sample_idx].append(reward)
+
         metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+        for data_source, rewards in data_source_reward.items():
+            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        for data_source, q_rewards in data_source_index_reward.items():
+            n = len(next(iter(q_rewards.values())))
+            data_source_pass = [max(rewards) for rewards in q_rewards.values()]
+            metric_dict[f'val/test_score/{data_source}/pass@{n}'] = np.mean(data_source_pass)
+
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
@@ -1334,9 +1357,10 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
+                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            gts = [x['ground_truth'] for x in batch.non_tensor_batch["reward_model"]]
                             if "request_id" in batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
                                     "request_id",
@@ -1346,6 +1370,7 @@ class RayPPOTrainer:
                                 inputs=inputs,
                                 outputs=outputs,
                                 scores=scores,
+                                gts=gts,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
                             )
@@ -1398,7 +1423,7 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, reward_extra_infos_keys=list(reward_extra_infos_dict.keys())))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

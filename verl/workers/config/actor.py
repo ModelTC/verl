@@ -218,6 +218,7 @@ class FSDPActorConfig(ActorConfig):
     entropy_checkpointing: bool = False
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
+    use_token_level_loss: bool = False
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

@@ -108,3 +108,5 @@ class InternVLChatConfig(PretrainedConfig):
         output['eos_token_id'] = self.eos_token_id
 
         return output
+
+AutoConfig.register("internvl_chat", InternVLChatConfig)

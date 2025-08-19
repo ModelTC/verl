@@ -10,6 +10,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as T
 import transformers
 from PIL import Image
@@ -340,6 +341,168 @@ def dynamic_preprocess_v3(image, min_num=1, max_num=6, image_size=448, use_thumb
         thumbnail_img = image.resize((image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images
+
+
+def find_closest_aspect_ratio_v4(width, height, min_num=1, max_num=6, image_size=448):
+    # llava like, from https://huggingface.co/openbmb/MiniCPM-V-2_6/blob/3f7a8da1b7a8b928b5ee229fae33cf43fd64cf31/image_processing_minicpmv.py#L257 with modification 
+    original_width = width
+    original_height = height
+
+    log_ratio = math.log(original_width / original_height)
+    # ratio = original_width * original_height / (image_size * image_size)
+    ratio = max(original_width/image_size, 1) * max(original_height/image_size, 1)
+
+    # Ensure multiple is not less than min_num
+    multiple = max(min(math.ceil(ratio), max_num), min_num)
+    
+    # Generate candidate split counts, ensuring they are not less than min_num
+    candidate_split_grids_nums = []
+    for i in [multiple - 1, multiple, multiple + 1]:
+        if min_num <= i <= max_num:
+            candidate_split_grids_nums.append(i)
+    # If no suitable candidates are found, use min_num
+    if not candidate_split_grids_nums:
+        candidate_split_grids_nums = [min_num]
+    
+    candidate_grids = []
+    for split_grids_nums in candidate_split_grids_nums:
+        m = 1
+        while m <= split_grids_nums:
+            if split_grids_nums % m == 0:
+                candidate_grids.append([m, split_grids_nums // m])
+            m += 1
+
+    best_grid = [1, min_num]
+    min_error = float("inf")
+    for grid in candidate_grids:
+        error = abs(log_ratio - math.log(grid[0] / grid[1]))
+        if error < min_error:
+            best_grid = grid
+            min_error = error
+
+    return best_grid
+
+
+def pad_image_tensor(image_tensor, target_width, target_height, image_position="top_left", pad_value=2.7):
+    """
+    Pad the image tensor to the target width and height.
+    """
+    _, current_height, current_width = image_tensor.shape
+    pad_width = target_width - current_width
+    pad_height = target_height - current_height
+
+    if image_position == "center":
+        left = pad_width // 2
+        right = pad_width - left
+        top = pad_height // 2
+        bottom = pad_height - top
+    elif image_position == "top_left":
+        left = 0
+        right = pad_width
+        top = 0
+        bottom = pad_height
+    else:
+        raise ValueError(
+            f"Invalid image_position: '{image_position}'. Must be 'center' or 'top_left'."
+        )
+
+    padded_image_tensor = F.pad(image_tensor, (left, right, top, bottom), value=pad_value)
+    return padded_image_tensor
+
+
+def dynamic_preprocess_v4(image, min_num=1, max_num=12, image_size=448, use_thumbnail=True, pad_thumbnail=False, image_position='center'):
+    """
+    Preprocess the image dynamically by finding the closest aspect ratio.
+    Converting the PIL image to a PyTorch tensor, resizing the image while maintaining aspect ratio and normalizing its pixel values.
+    Padding the Tensor(using a special value falls outside the normalization range) to the calculated target closest aspect ratio.
+    Splitting the Tensor into smaller blocks.
+    Optionally add a thumbnail version of the image.
+
+    Returns:
+        list[torch.Tensor]: A list of preprocessed, normalized, and padded image patches as PyTorch Tensors.
+    """
+    original_width, original_height = image.size
+    target_aspect_ratio = find_closest_aspect_ratio_v4(original_width, original_height, min_num, max_num, image_size)
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+    scale = min(target_width/ original_width, target_height / original_height)
+
+    transform = T.Compose(
+        [
+            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+            T.Resize((max(1, int(original_height * scale)), max(1, int(original_width * scale))), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+    image_tensor = transform(image)
+    image_tensor = pad_image_tensor(image_tensor, target_width, target_height, image_position=image_position)
+
+    pixel_values = []
+    for i in range(blocks):
+        start_x = (i % (target_width // image_size)) * image_size
+        end_x = (i % (target_width // image_size) + 1) * image_size
+        start_y = (i // (target_width // image_size)) * image_size
+        end_y = ((i // (target_width // image_size)) + 1) * image_size
+
+        split_tensor = image_tensor[:, start_y:end_y, start_x:end_x]
+        assert split_tensor.shape[1] == image_size and split_tensor.shape[2] == image_size, \
+            f"split_tensor shape {split_tensor.shape} does not match expected size {(3, image_size, image_size)} for block {i}."
+        pixel_values.append(split_tensor)
+    assert len(pixel_values) == blocks
+
+    if use_thumbnail and len(pixel_values) != 1:
+        if pad_thumbnail:
+            transform_thumbnail = T.Compose(
+                [
+                    T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                    T.Resize((int(original_height * scale / target_height * image_size), int(original_width * scale / target_width * image_size)), interpolation=InterpolationMode.BICUBIC),
+                    T.ToTensor(),
+                    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+                ]
+            )
+            thumbnail_pixel_values = transform_thumbnail(image)
+            thumbnail_pixel_values = pad_image_tensor(thumbnail_pixel_values, image_size, image_size, image_position=image_position)
+        else:
+            transform_thumbnail = T.Compose(
+                [
+                    T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                    T.Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC),
+                    T.ToTensor(),
+                    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+                ]
+            )
+            thumbnail_pixel_values = transform_thumbnail(image)
+        pixel_values.append(thumbnail_pixel_values)
+    return pixel_values
+
+
+def get_image_patch_v4(orign_width, orign_height, min_num=1, max_num=6, image_size=448, use_thumbnail=True):
+    """
+    Calculate the number of image patches based on the closest aspect ratio
+    and the given width and height of the original image.
+    """
+    if min_num < 1:
+        print(f"WARNING: min_num < 0, {min_num}")
+        min_num = 1
+    if max_num < 1:
+        print(f"WARNING: max_num < 0, {max_num}")
+        max_num = 1
+    if min_num > max_num:
+        print(f"WARNING: min_num > max_num, ({min_num}, {max_num})")
+        min_num = max_num
+    if orign_width <= 1:
+        print(f"WARNING: orign_width <= 0, ({orign_width})")
+        orign_width = 1
+    if orign_height <= 1:
+        print(f"WARNING: orign_height <= 0, ({orign_height})")
+        orign_height = 1
+    target_aspect_ratio = find_closest_aspect_ratio_v4(orign_width, orign_height, min_num, max_num, image_size)
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+    if use_thumbnail and blocks != 1:
+        blocks += 1
+    return blocks
 
 
 def expand2square(pil_img, background_color):

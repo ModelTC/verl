@@ -18,6 +18,7 @@ from .dapo import DAPORewardManager
 from .naive import NaiveRewardManager
 from .prime import PrimeRewardManager
 from .deepscaler import DeepScalerRewardManager
+from .omni_reward import OmniRewardManager
 
 # Note(haibin.lin): no need to include all reward managers here in case of complicated dependencies
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "NaiveRewardManager",
     "PrimeRewardManager",
     "DeepScalerRewardManager",
+    "OmniRewardManager",
     "register",
     "get_reward_manager_cls",
 ]

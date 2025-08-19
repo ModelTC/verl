@@ -17,7 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 import torch
@@ -77,7 +77,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def compute_data_metrics(batch: DataProto, use_critic: bool = True, reward_extra_infos_keys: List[str] = []) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -103,6 +103,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    
+    if "format_score" in batch.non_tensor_batch:
+        sequence_score_format = batch.non_tensor_batch['format_score']
+    if "correctness_score" in batch.non_tensor_batch:
+        sequence_score_correctness = batch.non_tensor_batch['correctness_score']
+    if "length_score" in batch.non_tensor_batch:
+        sequence_score_length = batch.non_tensor_batch['length_score']
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
@@ -176,6 +183,49 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["num_turns/min"] = num_turns.min()
         metrics["num_turns/max"] = num_turns.max()
         metrics["num_turns/mean"] = num_turns.mean()
+
+    # log per-dataset reward
+    reward_by_data_source = defaultdict(list)
+    for data_source, reward in zip(batch.non_tensor_batch["data_source"], sequence_reward):
+        reward_by_data_source[data_source].append(reward)
+
+    for data_source, rewards in reward_by_data_source.items():
+        if len(rewards) > 0:
+            metrics[f"critic/rewards/{data_source}/mean"] = torch.mean(torch.tensor(rewards)).detach().item()
+
+    reward_extra_infos_keys = [x for x in reward_extra_infos_keys if x != "score" and x in batch.non_tensor_batch]
+
+    for key in reward_extra_infos_keys:
+        value = batch.non_tensor_batch[key]
+        numeric_tensor = None
+        
+        try:
+            # process numpy array
+            if hasattr(value, 'dtype') and hasattr(value, 'shape'):
+                if np.issubdtype(value.dtype, np.number) or value.dtype == np.dtype('O'):
+                    numeric_tensor = torch.tensor(value.astype(float))
+            
+            # process list or tuple
+            elif isinstance(value, (list, tuple)):
+                # check if all elements are numeric
+                if len(value) > 0 and all(isinstance(x, (int, float, np.number)) for x in value):
+                    numeric_tensor = torch.tensor([float(x) for x in value])
+            
+            # process single numeric value
+            elif isinstance(value, (int, float, np.number)):
+                numeric_tensor = torch.tensor([float(value)])
+            
+            # only calculate statistics if numeric tensor is valid
+            if numeric_tensor is not None:
+                numeric_tensor = numeric_tensor[~torch.isnan(numeric_tensor)]
+                if numeric_tensor.numel() > 0:
+                    metrics[f"critic/rewards/{key}/mean"] = torch.mean(numeric_tensor).detach().item()
+                    metrics[f"critic/rewards/{key}/max"] = torch.max(numeric_tensor).detach().item()
+                    metrics[f"critic/rewards/{key}/min"] = torch.min(numeric_tensor).detach().item()
+                
+        except Exception as e:
+            continue
+
 
     return metrics
 
