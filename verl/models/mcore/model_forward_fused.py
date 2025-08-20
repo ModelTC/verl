@@ -32,6 +32,7 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
 
 from .qwen2_5_vl.model import Qwen2_5VLModel
+from .intern_vl.model import InternVLModel
 from .util import postprocess_packed_seqs_for_dict_output
 
 
@@ -42,6 +43,11 @@ def patch_fused_forward(model: torch.nn.Module):
     elif isinstance(model, Qwen2_5VLModel):
         if not hasattr(model, "language_model"):
             # the qwen2.5vl model might only have vision_model
+            return
+        model = model.language_model
+    elif isinstance(model, InternVLModel):
+        if not hasattr(model, "language_model"):
+            # the internvl model might only have vision_model
             return
         model = model.language_model
     else:
@@ -91,6 +97,68 @@ def fused_forward_gptmodel(
         packed_seq_params=packed_seq_params,
     )
 
+    if post_process:
+        # output_orig is in type of CausalLMOutputForPPO
+        output = postprocess_packed_seqs_for_dict_output(
+            labels_mask_rmpad,
+            output_orig,
+            packed_seq_params,
+            attention_mask,
+            batch_size,
+            seq_len,
+            post_process=post_process,
+        )
+    else:
+        output = output_orig
+    return output
+
+
+def fused_forward_intern_vl(
+    model,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    attention_mask: Tensor,
+    labels: Tensor,
+    labels_mask: Tensor,
+    multi_modal_inputs=None,
+    **kwargs,
+):
+    # pre_process = unwrap_model(model).pre_process
+    post_process = unwrap_model(model).post_process
+
+    pixel_values = (
+        multi_modal_inputs["pixel_values"].to(input_ids.device) if "pixel_values" in multi_modal_inputs else None
+    )
+    image_flags = (
+        multi_modal_inputs["image_flags"].to(input_ids.device) if "image_flags" in multi_modal_inputs else None
+    )
+    img_context_token_id = multi_modal_inputs["img_context_token_id"][0].item() if "img_context_token_id" in multi_modal_inputs else None
+
+    batch_size, seq_len = attention_mask.shape[:2]
+    input_ids_clone = input_ids.clone()
+    img_idx = torch.arange((input_ids_clone == img_context_token_id).sum()).to(dtype=input_ids_clone.dtype, device=input_ids_clone.device)
+    img_token_idxs = input_ids_clone == img_context_token_id
+    input_ids_clone[img_token_idxs] = img_idx
+    img_token_idxs_rmpad, _ = preprocess_packed_seqs(input_ids_clone, attention_mask, pre_process=True)
+    input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+    labels_rmpad, _ = preprocess_packed_seqs(labels, attention_mask, pre_process=True)
+    labels_mask_rmpad, _ = preprocess_packed_seqs(labels_mask, attention_mask, pre_process=True)
+    position_ids_rmpad, _ = preprocess_packed_seqs(position_ids, attention_mask, pre_process=True)
+    labels_rmpad = labels_rmpad.contiguous()
+    labels_mask_rmpad = labels_mask_rmpad.contiguous()
+    input_ids_rmpad = input_ids_rmpad.contiguous()
+    img_token_idxs_rmpad = img_token_idxs_rmpad.contiguous()
+    position_ids_rmpad = position_ids_rmpad.contiguous()
+    output_orig: CausalLMOutputForPPO = model(
+        input_ids=input_ids_rmpad,
+        attention_mask=None,
+        position_ids=position_ids_rmpad,
+        packed_seq_params=packed_seq_params,
+        pixel_values=pixel_values,
+        image_flags=image_flags,
+        img_token_idxs=img_token_idxs_rmpad,
+        labels=labels_rmpad,
+    )
     if post_process:
         # output_orig is in type of CausalLMOutputForPPO
         output = postprocess_packed_seqs_for_dict_output(

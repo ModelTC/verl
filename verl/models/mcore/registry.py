@@ -41,6 +41,7 @@ from .model_forward import (
 from .model_forward_fused import (
     fused_forward_gptmodel,
     fused_forward_qwen2_5_vl,
+    fused_forward_intern_vl,
 )
 from .model_initializer import (
     BaseModelInitializer,
@@ -131,6 +132,7 @@ MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.QWEN3_MOE: fused_forward_gptmodel,
     SupportedModel.QWEN2_5_VL: fused_forward_qwen2_5_vl,
     SupportedModel.DEEPSEEK_V3: fused_forward_gptmodel,
+    SupportedModel.INTERN_VL: fused_forward_intern_vl,
 }
 
 # Registry for model weight converters
