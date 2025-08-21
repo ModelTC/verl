@@ -87,16 +87,41 @@ class InternVisionTransformerBlock(TransformerBlock):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
         
-        for idx, encoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
-            if True:
-                layer_outputs, _ = tensor_parallel.checkpoint(
-                    encoder_layer,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                )
-            hidden_states = layer_outputs
+        # for idx, encoder_layer in enumerate(self.layers):
+        #     if output_hidden_states:
+        #         encoder_states = encoder_states + (hidden_states,)
+        #     if True:
+        #         layer_outputs, _ = tensor_parallel.checkpoint(
+        #             encoder_layer,
+        #             self.config.distribute_saved_activations,
+        #             hidden_states,
+        #         )
+        #     hidden_states = layer_outputs
+
+        def custom(start: int, end: int):
+            def custom_forward(hidden_states):
+                for index in range(start, end):
+                    layer = self._get_layer(index)
+                    hidden_states, _ = layer(hidden_states)
+                return hidden_states
+
+            return custom_forward
+
+        def checkpoint_handler(forward_func):
+            return tensor_parallel.checkpoint(
+                forward_func,
+                self.config.distribute_saved_activations,
+                hidden_states,
+            )
+
+        recompute_num_layers = 5
+        assert len(self.layers) % recompute_num_layers == 0, f"{len(self.layers)=}, {recompute_num_layers=}"
+        layer_idx = 0
+        while layer_idx < len(self.layers):
+            hidden_states = checkpoint_handler(
+                custom(layer_idx, layer_idx + recompute_num_layers)
+            )
+            layer_idx += recompute_num_layers
             
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
