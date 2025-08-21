@@ -1297,7 +1297,17 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor_list = []
                             reward_extra_infos_dict = defaultdict(list)
-                            reward_results = ray.get(reward_futures)
+                            try:
+                                timeout = self.config.reward_model.get("reward_fn_timeout", 120)
+                                reward_results = ray.get(reward_futures, timeout=timeout)
+                            except ray.exceptions.GetTimeoutError:
+                                print(f"Warning: Reward function timed out after {timeout} seconds")
+                                for future in reward_futures:
+                                    ray.cancel(future, force=True)
+                                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                                if rollout_data_dir:
+                                    batch.save_to_disk(f"{rollout_data_dir}/reward_timeout_data_step{self.global_steps}.pkl")
+                                continue
                             key2len = {}
                             for _, extra_infos in reward_results:
                                 for k, v in extra_infos.items():
