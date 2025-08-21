@@ -132,7 +132,11 @@ def fused_forward_intern_vl(
     image_flags = (
         multi_modal_inputs["image_flags"].to(input_ids.device) if "image_flags" in multi_modal_inputs else None
     )
-    img_context_token_id = multi_modal_inputs["img_context_token_id"][0].item() if "img_context_token_id" in multi_modal_inputs else None
+
+    try:
+        img_context_token_id = unwrap_model(model).img_context_token_id
+    except:
+        img_context_token_id = multi_modal_inputs["img_context_token_id"][0].item() if "img_context_token_id" in multi_modal_inputs else None
 
     batch_size, seq_len = attention_mask.shape[:2]
     input_ids_clone = input_ids.clone()
