@@ -126,12 +126,8 @@ def fused_forward_intern_vl(
     # pre_process = unwrap_model(model).pre_process
     post_process = unwrap_model(model).post_process
 
-    pixel_values = (
-        multi_modal_inputs["pixel_values"].to(input_ids.device) if "pixel_values" in multi_modal_inputs else None
-    )
-    image_flags = (
-        multi_modal_inputs["image_flags"].to(input_ids.device) if "image_flags" in multi_modal_inputs else None
-    )
+    pixel_values = multi_modal_inputs["pixel_values"] if "pixel_values" in multi_modal_inputs else None
+    image_flags = multi_modal_inputs["image_flags"] if "image_flags" in multi_modal_inputs else None
 
     try:
         img_context_token_id = unwrap_model(model).img_context_token_id
@@ -153,6 +149,7 @@ def fused_forward_intern_vl(
     input_ids_rmpad = input_ids_rmpad.contiguous()
     img_token_idxs_rmpad = img_token_idxs_rmpad.contiguous()
     position_ids_rmpad = position_ids_rmpad.contiguous()
+
     output_orig: CausalLMOutputForPPO = model(
         input_ids=input_ids_rmpad,
         attention_mask=None,

@@ -172,33 +172,14 @@ class InternVLModel(MegatronModule):
         )
 
         return vit_embeds
-    
+
     def preprocess_for_sp(self, pixel_values, image_flags):
-        sp_num = mpu.get_context_parallel_world_size()
+        sp_size = self.SP_SIZE
         num_image = pixel_values.shape[0]
-        if num_image % sp_num != 0:
-            from PIL import Image
-            import torchvision.transforms as T
-            from torchvision.transforms.functional import InterpolationMode
-            num_pad_image = sp_num - num_image % sp_num
-            _, _, h, w = pixel_values.shape
-
-            transform = T.Compose([
-                T.Resize((w, h), interpolation=InterpolationMode.BICUBIC),
-                T.ToTensor(),
-                T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-            ])
-
-            pad_images = []
-            pad_images_flages = []
-            for i in range(num_pad_image):
-                fake_img = Image.new('RGB', (224, 224), (255, 255, 255))
-                fake_img = transform(fake_img)
-                pad_images.append(fake_img)
-                pad_images_flages.append(0)
-
-            pad_images = torch.stack(pad_images).to(dtype=pixel_values.dtype, device=pixel_values.device)
-            pad_images_flages = torch.tensor(pad_images_flages, dtype=torch.long).to(dtype=image_flags.dtype, device=image_flags.device)
+        if num_image % sp_size != 0:
+            num_pad_image = sp_size - num_image % sp_size
+            pad_images = torch.zeros(num_pad_image, 3, self.image_size, self.image_size, device=pixel_values.device, dtype=pixel_values.dtype)
+            pad_images_flages = torch.tensor([0] * num_pad_image, dtype=torch.long).to(dtype=image_flags.dtype, device=image_flags.device)
             pixel_values = torch.cat([pixel_values, pad_images], dim=0)
             image_flags = torch.cat([image_flags, pad_images_flages], dim=0)
         return pixel_values, image_flags
@@ -238,9 +219,12 @@ class InternVLModel(MegatronModule):
                 else:
                     pixel_values = pixel_values[image_flags == 1]
                     image_flags = image_flags[image_flags == 1]
-                pixel_values = pixel_values.to(device=input_embeds.device, dtype=input_embeds.dtype)
+
                 pixel_values, image_flags = self.preprocess_for_sp(pixel_values, image_flags)
                 pixel_values = self.split_for_sp(pixel_values, pixel_values.shape[0], 0, self.SP_RANK)
+
+                pixel_values = pixel_values.to(device=input_embeds.device, dtype=input_embeds.dtype)
+                image_flags = image_flags.to(device=input_embeds.device)
                     
                 vit_batch_size = pixel_values.shape[0]
                 vit_embeds, _ = self.extract_feature(pixel_values)

@@ -499,6 +499,8 @@ class MegatronPPOActor(BasePPOActor):
                     multi_modal_inputs[key] = torch.cat(
                         [mmi[idx].get(key) for idx in idxs if mmi[idx].get(key) is not None], dim=0
                     )
+                    if key == "pixel_values":
+                        multi_modal_inputs[key] = multi_modal_inputs[key].to(dtype=torch.bfloat16)
             responses = batch["responses"]
             response_length = responses.size(1)
             label = position_ids.clone()
