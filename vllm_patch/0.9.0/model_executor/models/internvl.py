@@ -379,7 +379,7 @@ class BaseInternVLProcessor(ABC):
                 feature_size = num_patches * self.num_image_token
 
                 image_repl = self.get_image_repl(feature_size, num_patches)
-                text = [t.replace('<image>', image_repl.full, 1) for t in text]
+                text = [t.replace('<img></img>', image_repl.full, 1) for t in text]
 
         text_inputs = self.tokenizer(text)
 
@@ -471,7 +471,7 @@ class InternVLDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_images = mm_counts.get("image", 0)
 
-        return "<image>" * num_images
+        return "<img></img>" * num_images
 
     def get_dummy_mm_data(
         self,
@@ -572,7 +572,7 @@ class InternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
         return [
             PromptReplacement(
                 modality="image",
-                target="<image>",
+                target="<img></img>",
                 replacement=get_replacement_internvl,
             )
         ]

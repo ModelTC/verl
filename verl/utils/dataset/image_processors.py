@@ -90,7 +90,7 @@ def preprocess_images_internvl(
     - Dynamically generate patches for each image.
     - Stack all patch tensors into a single pixel_values tensor.
     - Create an image_flags tensor of ones.
-    - Replace each '<image>' placeholder in `text` with
+    - Replace each '<img></img>' placeholder in `text` with
       IMG_START_TOKEN + repeated IMG_CONTEXT_TOKEN + IMG_END_TOKEN,
       where the repetition count = num_patches_for_that_image * num_image_token.
 
@@ -101,24 +101,24 @@ def preprocess_images_internvl(
         image_size: Target size for each patch.
         use_thumbnail: If True, use thumbnail mode in dynamic preprocessing.
         num_image_token: Number of text tokens reserved per patch.
-        text: Optional input string containing '<image>' placeholders.
+        text: Optional input string containing '<img></img>' placeholders.
 
     Returns:
         Tuple of:
             image_inputs: dict with keys
                 - 'pixel_values': Tensor of shape (total_patches, 3, H, W)
                 - 'image_flags':   Tensor of shape (total_patches,)
-            updated_text: the input `text` with '<image>' replaced,
+            updated_text: the input `text` with '<img></img>' replaced,
                           or None if `text` was None.
     """
     num_images = len(images)
 
     # Validate placeholder count matches actual images
     if text is not None:
-        placeholder_count = text.count('<image>')
+        placeholder_count = text.count('<img></img>')
         if placeholder_count != num_images:
             raise ValueError(
-                f"Found {placeholder_count} '<image>' tokens but received {num_images} images."
+                f"Found {placeholder_count} '<img></img>' tokens but received {num_images} images."
             )
 
     if num_images > 0:
@@ -154,7 +154,7 @@ def preprocess_images_internvl(
                     IMG_CONTEXT_TOKEN * (n_patches * num_image_token) +
                     IMG_END_TOKEN
                 )
-                updated_text = updated_text.replace('<image>', token_seq, 1)
+                updated_text = updated_text.replace('<img></img>', token_seq, 1)
 
     else:
         # No images: return a dummy tensor and zero flags
