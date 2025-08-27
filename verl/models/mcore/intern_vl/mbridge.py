@@ -14,6 +14,13 @@ from .vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from .model import InternVLModel
 from .vision_config import get_vision_model_config, get_mlp_config
 
+from mbridge.core.util import (
+    broadcast_from_megatron_pp,
+    broadcast_str_from_megatron_pp,
+    unwrap_model,
+)
+from megatron.core import parallel_state as mpu
+
 @register_model("internvl_chat")
 class InternVLBridge(VLMBridge):
     """
@@ -646,3 +653,168 @@ class InternVLBridge(VLMBridge):
         base_config.update(self.extra_args)
 
         return self.TransformerConfigClass(**base_config)
+
+    def export_weights(
+        self, models: list[torch.nn.Module]
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        models = [unwrap_model(model) for model in models]
+
+        def get_model_chunk_generator():
+            for model in models:
+                existing_keys = set()
+                for name, param in model.named_parameters():
+                    existing_keys.add(name)
+                    yield name, param
+
+                # note
+                # there is a bug in megatron GPTModel
+                # decoder.layers[n].mlp.router.expert_bias" in GPTModel is not registered in named_parameter, but in state_dict().
+                # for now we patch it by adding those keys to extra_keys.
+                extra_keys = [
+                    x
+                    for x in model.state_dict().keys()
+                    if "_extra_state" not in x
+                    and "expert_bias" in x
+                    and x not in existing_keys
+                ]
+                for name in extra_keys:
+                    yield name, model.state_dict()[name].to(torch.cuda.current_device())
+
+        weights_names = []
+        for vpp_rank, model in enumerate(models):
+            existing_keys = set()
+            for name, param in model.named_parameters():
+                existing_keys.add(name)
+                weights_names.append((self.mpu.pp_rank, vpp_rank, name))
+            extra_keys = [
+                x
+                for x in model.state_dict().keys()
+                if "_extra_state" not in x
+                and "expert_bias" in x
+                and x not in existing_keys
+            ]
+            for name in extra_keys:
+                weights_names.append((self.mpu.pp_rank, vpp_rank, name))
+
+        weights_names_all_pp = [None] * self.mpu.pp_size
+        torch.distributed.all_gather_object(
+            object_list=weights_names_all_pp, obj=weights_names, group=self.mpu.pp_group
+        )
+        weights_names_all_pp = sum(weights_names_all_pp, [])
+        model_chunk_generator = get_model_chunk_generator()
+        local_to_global_maps = [
+            self._weight_name_mapping_mcore_local_to_global(model, consider_ep=False)
+            for model in models
+        ]
+        for iter_pp_rank, iter_vpp_rank, iter_name in weights_names_all_pp:
+            local_to_global_map = local_to_global_maps[iter_vpp_rank]
+            if iter_pp_rank == self.mpu.pp_rank:
+                try:
+                    name, param = next(model_chunk_generator)
+                except StopIteration:
+                    name, param = None, None
+                name = local_to_global_map[iter_name]
+            else:
+                name, param = None, None
+
+            name = broadcast_str_from_megatron_pp(name)
+            broad_pp_param = broadcast_from_megatron_pp(param)
+
+            # EP
+            if ".mlp.experts.linear_fc" in name and self.mpu.ep_size > 1:
+                num_experts = self.config.num_moe_experts
+                num_experts_per_rank = num_experts // self.mpu.ep_size
+                infer_params = [
+                    torch.empty_like(broad_pp_param) for _ in range(self.mpu.ep_size)
+                ]
+                torch.distributed.all_gather(
+                    infer_params, broad_pp_param, group=self.mpu.ep_group
+                )
+
+                name_prefix, local_expert_id = name.split(".weight")
+                local_expert_id = int(local_expert_id)
+                global_expert_ids = [
+                    num_experts_per_rank * ep_rank + local_expert_id
+                    for ep_rank in range(self.mpu.ep_size)
+                ]
+                global_expert_names = [
+                    f"{name_prefix}.weight{expert_id}"
+                    for expert_id in global_expert_ids
+                ]
+
+                for name, param in zip(global_expert_names, infer_params):
+                    if self.mpu.etp_size > 1:
+                        # gather etp
+                        etp_params = [
+                            torch.empty_like(param) for _ in range(self.mpu.etp_size)
+                        ]
+                        torch.distributed.all_gather(
+                            etp_params, param, group=self.mpu.etp_group
+                        )
+                        params = etp_params
+                    else:
+                        params = [param]
+
+                    merge_params = self._weight_merge_across_tp(
+                        name, params, broad_pp_param
+                    )
+                    converted_names, converted_params = self._weight_to_hf_format(
+                        name, merge_params
+                    )
+                    yield from zip(converted_names, converted_params)
+                continue
+
+            # TP
+            if (
+                hasattr(broad_pp_param, "tensor_model_parallel")
+                and broad_pp_param.tensor_model_parallel
+            ):
+                if mpu._VISION_TP_SIZE != mpu._LLM_TP_SIZE:
+                    if self.mpu.pp_rank == 0:
+                        self.mpu.tp_group = mpu._LLM_TP_GROUP
+                        self.mpu.tp_size = mpu._LLM_TP_SIZE
+                    
+                    if name.startswith("vision_model") or name.startswith("mlp1") or "word_embeddings" in name:
+                        infer_params = broad_pp_param
+                    else:
+                        # allocate a new tensor with proper size
+                        if self.mpu.tp_size <= 1:
+                            infer_params = [broad_pp_param]
+                        else:
+                            infer_params = [
+                                torch.empty_like(broad_pp_param)
+                                for _ in range(self.mpu.tp_size)
+                            ]
+                            torch.distributed.all_gather(
+                                infer_params, broad_pp_param, group=self.mpu.tp_group
+                            )
+                        infer_params = self._weight_merge_across_tp(
+                            name, infer_params, broad_pp_param
+                        )
+                else:
+                    # allocate a new tensor with proper size
+                    if self.mpu.tp_size <= 1:
+                        infer_params = [broad_pp_param]
+                    else:
+                        infer_params = [
+                            torch.empty_like(broad_pp_param)
+                            for _ in range(self.mpu.tp_size)
+                        ]
+                        torch.distributed.all_gather(
+                            infer_params, broad_pp_param, group=self.mpu.tp_group
+                        )
+
+                    infer_params = self._weight_merge_across_tp(
+                        name, infer_params, broad_pp_param
+                    )
+            else:
+                infer_params = broad_pp_param
+
+            converted_names, converted_params = self._weight_to_hf_format(
+                name, infer_params
+            )
+
+            yield from zip(converted_names, converted_params)
+
+        self.mpu.tp_group = mpu.get_tensor_model_parallel_group()
+        self.mpu.tp_size = mpu.get_tensor_model_parallel_world_size()

@@ -59,6 +59,7 @@ from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.config import McoreCriticConfig
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
+from verl.workers.vision_tp_utils import init_vision_tp 
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -119,6 +120,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
                 nccl_communicator_config_path=None,
             )
+
+            if self.config.actor.megatron.get("vision_tensor_model_parallel_size", None):
+                assert self.config.actor.megatron.vision_tensor_model_parallel_size == 1, \
+                    "vision_tensor_model_parallel_size must be 1 for now"
+                init_vision_tp(self.config)
 
         set_random_seed(seed=self.config.actor.megatron.seed)
 

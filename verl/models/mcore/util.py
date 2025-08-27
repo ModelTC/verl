@@ -32,7 +32,7 @@ def preprocess_packed_seqs(
     batch_size = input_ids.shape[0]
 
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    tp_size = mpu.get_tensor_model_parallel_world_size()
+    tp_size = mpu._LLM_TP_SIZE or mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
     align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
