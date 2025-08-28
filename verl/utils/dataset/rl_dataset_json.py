@@ -8,17 +8,14 @@ from PIL import UnidentifiedImageError
 
 import copy
 import re
-import io
 from omegaconf import DictConfig, ListConfig
 from typing import List, Optional, Union
-
-import base64
 
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.dataset.utils import dynamic_preprocess_v3, build_transform, preprocess_internlm_v3_mm_chat, IMG_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN
-
+from verl.utils.dataset.image_processors import pil_to_base64
 
 def process_image(image: dict, max_pixels: int = 1536 * 1536, min_pixels: int = 128 * 128, max_aspect_ratio: float = 100):
     import math
@@ -157,17 +154,12 @@ class RLHFJSONDataset(RLHFDataset):
         else:
             return self._default_preprocess(row_dict)
 
-    def _build_messages(self, messages: dict, images: list):
+    def _build_messages(self, messages: dict, images_base64: list):
         for message in messages:
             text = message["content"]
             content_list = []
             for _ in range(text.count("<image>")):
-                image = images.pop(0)
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='PNG')
-                img_byte_arr = img_byte_arr.getvalue()
-                img_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
-                
+                img_base64 = images_base64.pop(0)
                 content_list.append({
                     "type": "image_url",
                     "image_url": {
@@ -176,7 +168,7 @@ class RLHFJSONDataset(RLHFDataset):
                 })
             content_list.append({"type": "text", "text": text})
             message["content"] = content_list
-        assert len(images) == 0
+        assert len(images_base64) == 0
 
         return messages
 
@@ -188,6 +180,7 @@ class RLHFJSONDataset(RLHFDataset):
 
         if self.input_template:
             question = chat[0]["content"]
+            question = question.replace('<image>', '<image>')
             prompt_with_chat_template = self.input_template.format(question)
         else:
             prompt_with_chat_template = self.tokenizer.apply_chat_template(
@@ -199,18 +192,20 @@ class RLHFJSONDataset(RLHFDataset):
         is_multi_modal = self.image_key in row_dict
         if is_multi_modal:
             transform = build_transform(is_train=False, input_size=self.image_size, pad2square=self.pad2square)
-            output_dict['multi_modal_data'] = {'image': [process_image(self.tcs_loader(image)) for image in row_dict.pop(self.image_key)]}
+            # output_dict['multi_modal_data'] = {'image': [process_image(self.tcs_loader(image)) for image in row_dict.pop(self.image_key)]}
+            origin_images = [process_image(self.tcs_loader(image)) for image in row_dict.pop(self.image_key)]
+            output_dict['multi_modal_data'] = {"image_base64": [pil_to_base64(image) for image in origin_images]}
 
             # convert image to patches
-            num_image = len(output_dict['multi_modal_data']['image'])
+            num_image = len(origin_images)
             images, num_tiles = [], []
-            for image in output_dict['multi_modal_data']['image']:
+            for image in origin_images:
                 patches = dynamic_preprocess_v3(
-                    image, 
-                    min_num=self.min_dynamic_patch, 
+                    image,
+                    min_num=self.min_dynamic_patch,
                     # max_num=max(self.max_dynamic_patch // num_image, 1),
                     max_num=max(self.max_dynamic_patch, 1),
-                    image_size=self.image_size, 
+                    image_size=self.image_size,
                     use_thumbnail=self.use_thumbnail)
                 images.extend(patches)
                 num_tiles.append(len(patches))
@@ -227,16 +222,19 @@ class RLHFJSONDataset(RLHFDataset):
                 prompt_with_chat_template = prompt_with_chat_template.replace('<image>', f"{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_tokens[i]}{IMG_END_TOKEN}", 1)
 
             # build multi_modal_inputs
-            output_dict['multi_modal_inputs'] = {
-                'pixel_values': pixel_values,
-                'image_flags': image_flags
-            }
+            # output_dict['multi_modal_inputs'] = {
+            #     'pixel_values': pixel_values,
+            #     'image_flags': image_flags
+            # }
+
+            output_dict['multi_modal_inputs'] = {}
         else:
             output_dict['multi_modal_data'] = None
-            output_dict['multi_modal_inputs'] = {
-                'pixel_values': torch.zeros(1, 3, self.image_size, self.image_size), 
-                'image_flags': torch.zeros(1, dtype=torch.long)
-            }
+            output_dict['multi_modal_inputs'] = {}
+            # output_dict['multi_modal_inputs'] = {
+            #     'pixel_values': torch.zeros(1, 3, self.image_size, self.image_size),
+            #     'image_flags': torch.zeros(1, dtype=torch.long)
+            # }
         
         model_inputs = self.tokenizer(prompt_with_chat_template, return_tensors='pt', add_special_tokens=False)
         input_ids = model_inputs.pop("input_ids")
@@ -260,7 +258,7 @@ class RLHFJSONDataset(RLHFDataset):
         output_dict["prompt_length"] = output_dict['position_ids'].max().item() + 1
 
         if is_multi_modal:
-            messages = self._build_messages(chat, copy.deepcopy(output_dict['multi_modal_data']['image']))
+            messages = self._build_messages(chat, copy.deepcopy(output_dict['multi_modal_data']['image_base64']))
         else:
             messages = chat
 

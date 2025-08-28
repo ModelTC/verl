@@ -1,4 +1,6 @@
+import base64
 from io import BytesIO
+import io
 import math
 import torch
 from typing import Optional, Union, List, Tuple, Dict
@@ -232,3 +234,16 @@ def preprocess_images_qwenvl(
     image_inputs['image_flags'] = torch.tensor([1] * image_inputs['pixel_values'].size(0), dtype=torch.long) * int(num_images > 0)
         
     return image_inputs, updated_text
+
+def base64_to_pil(image_base64):
+    image_data = base64.b64decode(image_base64)
+    image_io = io.BytesIO(image_data)
+    image = Image.open(image_io)
+    return image
+
+
+def pil_to_base64(image, format="PNG"):
+    buffered = io.BytesIO()
+    image.save(buffered, format=format)  # You can change the format if needed, e.g., "JPEG"
+    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return image_base64

@@ -16,10 +16,12 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
+from functools import partial
 import logging
 import os
 import time
 from typing import Any
+import time
 
 import psutil
 import torch
@@ -57,6 +59,7 @@ from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.config import McoreCriticConfig
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
+from verl.utils.dataset.image_processors import preprocess_images_internvl, base64_to_pil
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -159,6 +162,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "`log_prob_micro_batch_size` should not be None at the same time."
                 )
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
+
+        self.multi_modal_buffer = None
+
 
     def _build_model_optimizer(self, model_path, optim_config, override_model_config, override_transformer_config):
         from verl.utils.megatron.optimizer import get_megatron_optimizer, get_megatron_optimizer_param_scheduler
@@ -498,6 +504,76 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         get_torch_device().empty_cache()
         log_gpu_memory_usage("After init_model finish", logger=logger)
 
+    def clean_multi_modal_buffer(self):
+        self.multi_modal_buffer = None
+
+    def multi_modal_preprocess(self, data: DataProto):
+        torch.cuda.synchronize()
+        start_time = time.time()
+        if 'multi_modal_data' not in data.non_tensor_batch:
+            return data
+        if self.multi_modal_buffer is not None:
+            data.non_tensor_batch['multi_modal_inputs'] = self.multi_modal_buffer # NOTE: deep copy ?
+        else:
+
+            image_size = self.hf_config.force_image_size or self.hf_config.vision_config.image_size
+            patch_size = self.hf_config.vision_config.patch_size
+            downsample_ratio = self.hf_config.downsample_ratio
+            preprocess_images_fn = partial(
+                preprocess_images_internvl,
+                image_size=image_size, 
+                min_dynamic_patch=self.hf_config.min_dynamic_patch, 
+                max_dynamic_patch=self.hf_config.max_dynamic_patch, 
+                use_thumbnail=self.hf_config.use_thumbnail, 
+                num_image_token=int((image_size // patch_size)**2 * (downsample_ratio**2))
+            )
+
+            for item_idx in range(len(data.non_tensor_batch['multi_modal_data'])):
+                if 'pixel_values' in data.non_tensor_batch['multi_modal_inputs'][item_idx]:
+                    continue
+                multi_modal_data = data.non_tensor_batch['multi_modal_data'][item_idx]
+                if 'image_base64' in multi_modal_data:
+                    images = [base64_to_pil(image_base64) for image_base64 in multi_modal_data['image_base64']]
+                    image_inputs, _ = preprocess_images_fn(images=images)
+                    data.non_tensor_batch['multi_modal_inputs'][item_idx].update(image_inputs)
+                else:
+                    data.non_tensor_batch['multi_modal_inputs'][item_idx].update({
+                        'pixel_values': torch.zeros(1, 3, image_size, image_size), 
+                        'image_flags': torch.zeros(1, dtype=torch.long)
+                    })
+
+            self.multi_modal_buffer = data.non_tensor_batch['multi_modal_inputs']
+
+        torch.cuda.synchronize()
+        end_time = time.time()
+        print(f"!!! multi_modal_preprocess time: {end_time - start_time}")
+
+        return data
+
+    def multi_modal_get_image(self, data: DataProto):
+        torch.cuda.synchronize()
+        start_time = time.time()
+        if 'multi_modal_data' not in data.non_tensor_batch:
+            return data
+        
+        for item_idx in range(len(data.non_tensor_batch['multi_modal_data'])):
+            if 'image' in data.non_tensor_batch['multi_modal_data'][item_idx]:
+                continue
+            if 'image_base64' in data.non_tensor_batch['multi_modal_data'][item_idx]:
+                images = [base64_to_pil(image_base64) for image_base64 in data.non_tensor_batch['multi_modal_data'][item_idx]['image_base64']]
+                data.non_tensor_batch['multi_modal_data'][item_idx]['image'] = images
+            else:
+                data.non_tensor_batch['multi_modal_data'][item_idx]['image'] = None
+        
+        print(f"!!! {len(data.non_tensor_batch['multi_modal_data'])=} {data.non_tensor_batch['multi_modal_data'][0].keys()=}")
+        for item_idx in range(len(data.non_tensor_batch['multi_modal_data'])):
+            assert 'image' in data.non_tensor_batch['multi_modal_data'][item_idx]
+            # assert 'image_base64' in data.non_tensor_batch['multi_modal_data'][item_idx]
+        torch.cuda.synchronize()
+        end_time = time.time()
+        print(f"!!! multi_modal_get_image time: {end_time - start_time}")
+        return data
+
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red")
@@ -509,6 +585,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+
+        data = self.multi_modal_preprocess(data)
         data.batch = data.batch.to(get_device_name())
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
@@ -539,6 +617,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        self.clean_multi_modal_buffer()
         aggressive_empty_cache(force_sync=True)
         return output
 
@@ -547,6 +626,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
+        prompts = self.multi_modal_get_image(prompts)
         prompts.batch = prompts.batch.to(get_device_name())
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
@@ -588,6 +668,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
             log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob", logger=logger)
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data = self.multi_modal_preprocess(data)
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
@@ -599,6 +680,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._ref_is_offload_param:
             offload_megatron_model_to_cpu(self.ref_module)
             log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob", logger=logger)
+        self.clean_multi_modal_buffer()
         aggressive_empty_cache(force_sync=True)
         return output
 
@@ -606,11 +688,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @GPUMemoryLogger(role="compute_log_prob", logger=logger)
     @DistProfiler.annotate(color="blue")
     def compute_log_prob(self, data: DataProto):
+
+        print(datetime.datetime.now(), '!!! start into compute_log_prob')
+
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
         # we should always recompute old_log_probs when it is HybridEngine
+        data = self.multi_modal_preprocess(data)
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
@@ -626,6 +712,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
             log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
+
+        # self.clean_multi_modal_buffer()
         aggressive_empty_cache(force_sync=True)
         return output
 
