@@ -163,8 +163,8 @@ def format_prompt_agentic_legacy(
 
 format_prompt_fns = {
     'general': format_prompt_general,
-    # 'agentic': format_prompt_agentic,
-    'agentic': format_prompt_agentic_legacy
+    'agentic': format_prompt_agentic,
+    # 'agentic': format_prompt_agentic_legacy
 }
 
 

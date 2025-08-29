@@ -5,7 +5,12 @@ from .math.boxed_list import compute_score as math_boxed_list
 from .code.python_unittest import compute_score as code_python_unittest
 from .grounding.iou_single import compute_score as grounding_iou_single
 from .gui.diou import compute_score as gui_diou
+from .ocr.general_ocr import calculate_levenshtein, calculate_captcha_task1, calculate_levenshtein_multi_answers, calculate_levenshtein_w_value, calculate_levenshtein_ignore_capital
+from .llmjudge.llmjudge import compute_score as llm_judge
+from .grounding.point_counting import compute_score as grounding_point_counting
+
 import re
+
 compute_score_fns = {
     "math_boxed": math_boxed,
     "math_boxed_list": math_boxed_list,
@@ -13,7 +18,14 @@ compute_score_fns = {
     "ocr_grits_shape": ocr_grits_shape,
     "code_python_unittest": code_python_unittest,
     "grounding_iou_single": grounding_iou_single,
-    "gui_diou": gui_diou
+    "gui_diou": gui_diou,
+    "OCR_Levenshtein":calculate_levenshtein,
+    'OCR_Multi_Answers':calculate_levenshtein_multi_answers,
+    'OCR_Captcha_w_calculate':calculate_captcha_task1,
+    'OCR_Levenshtein_ignore_capital': calculate_levenshtein_ignore_capital,
+    'OCR_Levenshtein_w_value':calculate_levenshtein_w_value,
+    'llm_judge': llm_judge,
+    "grounding_point_counting": grounding_point_counting
 }
 
 # add think reward
