@@ -500,6 +500,7 @@ class InternVLBridge(VLMBridge):
             "use_cpu_initialization": False,
             "overlap_p2p_comm": overlap_p2p_comm,
             "batch_p2p_comm": batch_p2p_comm,
+            "qk_layernorm": getattr(hf_config, "qk_normalization", True),
         }
 
         # Update with any provided overrides
