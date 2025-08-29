@@ -25,6 +25,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForTokenClassification,
     AutoModelForVision2Seq,
+    AutoModel,
     GenerationConfig,
 )
 
@@ -37,9 +38,10 @@ def parse_args():
 
     base_op_parser = argparse.ArgumentParser(add_help=False)
     base_op_parser.add_argument(
-        "--backend", type=str, required=True, choices=["fsdp", "megatron"], help="The backend of the model"
+        "--backend", type=str, required=True, choices=["fsdp", "megatron", "megatron_mbridge"], help="The backend of the model"
     )
     base_op_parser.add_argument("--local_dir", type=str, default=None, help="Path to the saved model checkpoints.")
+    base_op_parser.add_argument("--hf_model_config_path", type=str, default=None, help="Path to the HuggingFace model configuration files.")
     base_op_parser.add_argument(
         "--tie-word-embedding",
         action="store_true",
@@ -132,7 +134,7 @@ def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
         "trust_remote_code": args.trust_remote_code,
         "is_value_model": args.is_value_model,
         "local_dir": args.local_dir,
-        "hf_model_config_path": os.path.join(args.local_dir, "huggingface"),
+        "hf_model_config_path": args.hf_model_config_path or os.path.join(args.local_dir, "huggingface"),
         "use_cpu_initialization": args.use_cpu_initialization,
     }
 
@@ -195,6 +197,8 @@ class BaseModelMerger(ABC):
             return AutoModelForCausalLM
         elif "ForConditionalGeneration" in self.model_config.architectures[0]:
             return AutoModelForVision2Seq
+        else:
+            return AutoModel
 
         raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
 
@@ -275,6 +279,7 @@ class BaseModelMerger(ABC):
     def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
         auto_model_class = self.get_transformers_auto_model_class()
         with init_empty_weights():
+            print(f"!!! {self.model_config=}")
             model = auto_model_class.from_config(
                 self.model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
             )

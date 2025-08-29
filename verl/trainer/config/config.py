@@ -36,6 +36,7 @@ class CheckpointConfig(BaseConfig):
     save_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
     load_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
     async_save: bool = False
+    use_dist_checkpointing: bool = False
 
 
 @dataclass
