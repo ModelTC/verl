@@ -59,7 +59,6 @@ from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.config import McoreCriticConfig
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
-from verl.utils.dataset.image_processors import preprocess_images_internvl, base64_to_pil
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -516,6 +515,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             data.non_tensor_batch['multi_modal_inputs'] = self.multi_modal_buffer # NOTE: deep copy ?
         else:
 
+            from PIL import Image
+            from verl.utils.dataset.image_processors import bytes_to_pil
+            from verl.utils.dataset.image_processors import preprocess_images_internvl
+
             image_size = self.hf_config.force_image_size or self.hf_config.vision_config.image_size
             patch_size = self.hf_config.vision_config.patch_size
             downsample_ratio = self.hf_config.downsample_ratio
@@ -528,12 +531,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 num_image_token=int((image_size // patch_size)**2 * (downsample_ratio**2))
             )
 
+            def image_convert(image_item):
+                if isinstance(image_item, Image.Image):
+                    return image_item
+                elif isinstance(image_item, bytes):
+                    return bytes_to_pil(image_item)
+                else:
+                    raise ValueError(f"Unsupported image type: {type(image_item)}")
+
             for item_idx in range(len(data.non_tensor_batch['multi_modal_data'])):
                 if 'pixel_values' in data.non_tensor_batch['multi_modal_inputs'][item_idx]:
                     continue
                 multi_modal_data = data.non_tensor_batch['multi_modal_data'][item_idx]
-                if 'image_base64' in multi_modal_data:
-                    images = [base64_to_pil(image_base64) for image_base64 in multi_modal_data['image_base64']]
+                if 'image' in multi_modal_data:
+                    images = [image_convert(image_item) for image_item in multi_modal_data['image']]
                     image_inputs, _ = preprocess_images_fn(images=images)
                     data.non_tensor_batch['multi_modal_inputs'][item_idx].update(image_inputs)
                 else:
@@ -548,30 +559,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         end_time = time.time()
         print(f"!!! multi_modal_preprocess time: {end_time - start_time}")
 
-        return data
-
-    def multi_modal_get_image(self, data: DataProto):
-        torch.cuda.synchronize()
-        start_time = time.time()
-        if 'multi_modal_data' not in data.non_tensor_batch:
-            return data
-        
-        for item_idx in range(len(data.non_tensor_batch['multi_modal_data'])):
-            if 'image' in data.non_tensor_batch['multi_modal_data'][item_idx]:
-                continue
-            if 'image_base64' in data.non_tensor_batch['multi_modal_data'][item_idx]:
-                images = [base64_to_pil(image_base64) for image_base64 in data.non_tensor_batch['multi_modal_data'][item_idx]['image_base64']]
-                data.non_tensor_batch['multi_modal_data'][item_idx]['image'] = images
-            else:
-                data.non_tensor_batch['multi_modal_data'][item_idx]['image'] = None
-        
-        print(f"!!! {len(data.non_tensor_batch['multi_modal_data'])=} {data.non_tensor_batch['multi_modal_data'][0].keys()=}")
-        for item_idx in range(len(data.non_tensor_batch['multi_modal_data'])):
-            assert 'image' in data.non_tensor_batch['multi_modal_data'][item_idx]
-            # assert 'image_base64' in data.non_tensor_batch['multi_modal_data'][item_idx]
-        torch.cuda.synchronize()
-        end_time = time.time()
-        print(f"!!! multi_modal_get_image time: {end_time - start_time}")
         return data
 
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
@@ -626,7 +613,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
-        prompts = self.multi_modal_get_image(prompts)
         prompts.batch = prompts.batch.to(get_device_name())
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id

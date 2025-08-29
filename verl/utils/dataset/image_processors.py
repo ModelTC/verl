@@ -235,15 +235,14 @@ def preprocess_images_qwenvl(
         
     return image_inputs, updated_text
 
-def base64_to_pil(image_base64):
-    image_data = base64.b64decode(image_base64)
-    image_io = io.BytesIO(image_data)
+
+def bytes_to_pil(image_bytes):
+    image_io = io.BytesIO(image_bytes)
     image = Image.open(image_io)
     return image
 
 
-def pil_to_base64(image, format="PNG"):
+def pil_to_bytes(image, format="PNG"):
     buffered = io.BytesIO()
     image.save(buffered, format=format)  # You can change the format if needed, e.g., "JPEG"
-    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return image_base64
+    return buffered.getvalue()

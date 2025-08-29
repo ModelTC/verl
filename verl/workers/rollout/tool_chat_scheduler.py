@@ -33,19 +33,31 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.models.transformers.qwen2_vl import get_rope_index
 
+import io
+import base64
 import numpy as np
+from PIL import Image
 from sandbox_fusion import run_jupyter_async, RunJupyterRequest
 
-from verl.utils.dataset.image_processors import (
-    adaptive_resize_image,
-    preprocess_images_internvl,
-    preprocess_images_qwenvl,
-    base64_to_pil,
-    pil_to_base64
-)
+from verl.utils.dataset.image_processors import adaptive_resize_image, preprocess_images_internvl, preprocess_images_qwenvl, pil_to_bytes
 
 def repeat_each(lst, n):
     return [x for x in lst for _ in range(n)]
+
+
+def base64_to_pil(image_base64):
+    image_data = base64.b64decode(image_base64)
+    image_io = io.BytesIO(image_data)
+    image = Image.open(image_io)
+    return image
+
+
+def pil_to_base64(image):
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")  # You can change the format if needed, e.g., "JPEG"
+    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return image_base64
+
 
 class ToolChatCompletionScheduler(ChatCompletionScheduler):
     """
@@ -54,6 +66,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
     """
     def __init__(self, config, model_path, server_addresses, sandbox_address, data_config, max_turns=10, **kwargs):
         super().__init__(config, model_path, server_addresses, **kwargs)
+        self.data_config = data_config
         self.sandbox_address = sandbox_address
         self.max_turns = max_turns
         self.max_prompt_length = data_config.max_prompt_length
@@ -386,10 +399,9 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             batch_loss_mask.append(loss_mask)
             batch_logps.append(logprobs)
 
-            image_inputs = {} # self._build_multi_modal_input(whole_images)
+            image_inputs = self._build_multi_modal_input(whole_images)
             multi_modal_inputs.append(image_inputs)
-            multi_modal_data.append({"image_base64": [pil_to_base64(image) for image in whole_images]})
-        
+            multi_modal_data.append({"image": [pil_to_bytes(image) for image in whole_images]})
 
         # prompts: [prompt] from input dataset
         prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
@@ -408,7 +420,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
 
         input_ids = torch.cat([prompts["input_ids"], responses["input_ids"]], dim=1)
         attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
-        position_ids = self._get_position_ids(input_ids, attention_mask, None)
+        position_ids = self._get_position_ids(input_ids, attention_mask, multi_modal_inputs)
 
         batch_loss_mask = pad_2d_list_to_length(batch_loss_mask, 0, self.max_response_length)
         batch_loss_mask = batch_loss_mask[:, :self.max_response_length]
@@ -427,6 +439,11 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             },
             batch_size=len(input_ids),
         )
+
+        if self.data_config.get('use_image_bytes', False):
+            multi_modal_inputs = [{}] * len(multi_modal_inputs)
+        else:
+            multi_modal_data = [{}] * len(multi_modal_data)
 
         non_tensor_batch = {
             "multi_modal_inputs": np.array(multi_modal_inputs, dtype=object),
