@@ -901,7 +901,7 @@ def compute_policy_loss_gspo(
     """
 
     assert config is not None
-    assert isinstance(config, AlgoConfig)
+    assert not isinstance(config, AlgoConfig), "passing AlgoConfig not supported yet"
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
 
