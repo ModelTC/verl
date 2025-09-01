@@ -114,7 +114,9 @@ class InternVisionTransformerBlock(TransformerBlock):
                 hidden_states,
             )
 
-        recompute_num_layers = 5
+        recompute_num_layers = 5    # for 235b
+        if len(self.layers) % recompute_num_layers != 0:
+            recompute_num_layers = 4    # for 30b
         assert len(self.layers) % recompute_num_layers == 0, f"{len(self.layers)=}, {recompute_num_layers=}"
         layer_idx = 0
         while layer_idx < len(self.layers):
