@@ -52,3 +52,40 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
         else:
             metrics[key] = np.mean(val)
     return metrics
+
+
+def process_async_metrics(metrics_list) -> dict[str, Any]:
+    from collections import defaultdict
+    metrics = defaultdict(list)
+    address_sequences = defaultdict(list)
+    timing = {}
+
+    for seq_metrics in metrics_list:
+        for key, val in seq_metrics.items():
+            if key == "address":
+                continue
+            metrics[key].append(val)
+
+        if 'address' in seq_metrics and 'generate_sequences' in seq_metrics:
+            address = seq_metrics['address']
+            generate_sequences = seq_metrics['generate_sequences']
+            address_sequences[address].append(generate_sequences)
+
+    for key, val in metrics.items():
+        timing[f"seq_{key}_mean"] = np.mean(val)
+        timing[f"seq_{key}_max"] = np.max(val)
+        timing[f"seq_{key}_min"] = np.min(val)
+
+    # 计算每个address下generate_sequences的最大值
+    address_max_values = []
+    for address, sequences in address_sequences.items():
+        max_val = np.max(sequences)
+        address_max_values.append(max_val)
+    
+    # 计算所有address之间的最大值、最小值、平均值
+    if address_max_values:
+        timing["engine_generate_max"] = np.max(address_max_values)
+        timing["engine_generate_min"] = np.min(address_max_values)
+        timing["engine_generate_mean"] = np.mean(address_max_values)
+
+    return timing

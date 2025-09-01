@@ -57,6 +57,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.metric.utils import process_async_metrics
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -1177,9 +1178,14 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                            self.async_rollout_manager.wake_up()
+                            with marked_timer("wake_up", timing_raw):
+                                self.async_rollout_manager.wake_up()
                             gen_batch_output = self.chat_scheduler_wg.generate_sequences(gen_batch)
-                            self.async_rollout_manager.sleep()
+                            with marked_timer("sleep", timing_raw):
+                                self.async_rollout_manager.sleep()
+                            async_metrics = gen_batch_output.non_tensor_batch['metrics'].tolist()
+                            gen_batch_output.meta_info["timing"] = process_async_metrics(async_metrics)
+                            gen_batch_output.non_tensor_batch.pop("metrics")
                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 

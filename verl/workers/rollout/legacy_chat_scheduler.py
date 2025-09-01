@@ -40,6 +40,7 @@ from verl.utils.fs import copy_to_local
 
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.base.worker import Worker
+from verl.utils.profiler.performance import simple_timer
 
 logger = logging.getLogger(__file__)
 
@@ -109,6 +110,7 @@ class ChatCompletionScheduler(Worker):
             **chat_complete_request: dict, request parameters same as OpenAI AsyncCompletions.create.
                 OpenAI API reference: https://platform.openai.com/docs/api-reference/chat/create
         """
+        metrics = callback_additional_info['metrics']
         if "extra_headers" not in chat_complete_request:
             chat_complete_request["extra_headers"] = {}
 
@@ -124,6 +126,7 @@ class ChatCompletionScheduler(Worker):
             address = self.weighted_addresses[0][1]
             self.weighted_addresses[0][0] += 1
             heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
+            metrics['address'] = address
 
         # use new request_id to avoid duplicate request_id problem
         request_id = uuid4().hex
@@ -134,7 +137,8 @@ class ChatCompletionScheduler(Worker):
         try:
             # NOTE: OpenAI client uses httpx, seems to have performance issue in high concurrency requests.
             # completions = await self._chat_completions_openai(address, **chat_complete_request)
-            completions = await self._chat_completions_aiohttp(address, **chat_complete_request)
+            with simple_timer('chat_completion', metrics):
+                completions = await self._chat_completions_aiohttp(address, **chat_complete_request)
         except Exception as e:
             # Let user handle the exception
             exception = e

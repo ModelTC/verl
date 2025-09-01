@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import json
+import time
 from typing import Any, Dict, List
 import random
 import json
@@ -32,6 +33,7 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.models.transformers.qwen2_vl import get_rope_index
+from verl.utils.profiler.performance import simple_timer
 
 import io
 import base64
@@ -284,12 +286,13 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
             assert exception is None, f"exception: {exception}, {type(exception)=} {info['response_length']=}, {self.max_response_length=} {info['turn']=}"
 
-            batch_conversations, batch_index, cells, turn, response_length = (
+            batch_conversations, batch_index, cells, turn, response_length, metrics = (
                 info["batch_conversations"],
                 info["batch_index"],
                 info["cells"],
                 info["turn"],
-                info["response_length"]
+                info["response_length"],
+                info["metrics"]
             )
 
             # process the response from completions
@@ -311,15 +314,19 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             response_length += len(message['token_ids_for_train'])
 
             if turn == self.max_turns or response_length > self.max_response_length:
+                metrics['end_time'] = time.time()
                 return
 
             # check if the response contains a tool call
-            tool_message = await _process_tool_call(cells, content)
+            with simple_timer('tool_call', metrics):
+                tool_message = await _process_tool_call(cells, content)
             if tool_message == None:
+                metrics['end_time'] = time.time()
                 return
 
             tool_message = self._update_message(tool_message)
             if response_length + len(tool_message['token_ids_for_train']) > self.max_response_length:
+                metrics['end_time'] = time.time()
                 return
 
             response_length += len(tool_message['token_ids_for_train'])
@@ -334,7 +341,8 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                     "batch_index": batch_index,
                     "cells": cells,
                     "turn": turn + 1,
-                    "response_length": response_length
+                    "response_length": response_length,
+                    "metrics": metrics
                 },
                 model=self.model_name,
                 messages=batch_conversations[batch_index] + [{"role": "assistant", "token_ids": self._chat_template_prefix_suffix['assistant']['prefix_ids']}],
@@ -346,6 +354,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         # TODO: we may need to control max concurrent requests here, or it will harm prefix cache hit rate.
         tasks, batch_conversations = [], [None] * len(batch)
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
+        batch_metrics = [{}] * len(batch)
 
         # For aiohttp
         kwargs['skip_special_tokens'] = False
@@ -353,6 +362,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         for batch_index, conversation in enumerate(raw_prompts):
             conversation = [self._update_message(msg) for msg in conversation.tolist()]
             batch_conversations[batch_index] = conversation
+            batch_metrics[batch_index] = {'start_time': time.time()}
             tasks.append(
                 asyncio.create_task(
                     self.submit_chat_completions(
@@ -363,6 +373,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                             "cells": [],
                             "turn": 1,
                             "response_length": 0,
+                            "metrics": batch_metrics[batch_index]
                         },
                         model=self.model_name,
                         messages=conversation + [{"role": "assistant", "token_ids": self._chat_template_prefix_suffix['assistant']['prefix_ids']}],
@@ -373,7 +384,20 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         await asyncio.gather(*tasks)
         print(f"[{self.__class__.__name__}] generate_sequences done")
 
-        return self._postprocess(batch, batch_conversations)
+        post_start = time.time()
+        output = self._postprocess(batch, batch_conversations)
+        post_time = time.time() - post_start
+
+        metrics_list = []
+        for index, metrics in enumerate(batch_metrics):
+            metrics['generate_sequences'] = metrics['end_time'] - metrics['start_time'] + post_time
+            metrics['postprocess'] = post_time
+            metrics.pop('start_time')
+            metrics.pop('end_time')
+            metrics_list.append(metrics)
+        output.non_tensor_batch['metrics'] = np.array(metrics_list, dtype=object)
+
+        return output
 
     def _postprocess(self, batch: DataProto, batch_conversations) -> DataProto:
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
