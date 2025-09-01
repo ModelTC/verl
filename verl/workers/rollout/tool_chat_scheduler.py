@@ -205,6 +205,9 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             if tool_call.get('name') != 'python':
                 return
 
+            if not isinstance(tool_call.get('arguments'), dict):
+                return
+
             code = tool_call.get('arguments', {}).get('code')
             if not code:
                 return
