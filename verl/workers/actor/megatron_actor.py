@@ -295,15 +295,19 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
 
         """
+        self.on_policy = len(data.batch) <= self.config.ppo_mini_batch_size and self.config.ppo_epochs == 1
+
         select_keys = [
             "responses",
             "input_ids",
             "attention_mask",
             "response_mask",
             "position_ids",
-            "old_log_probs",
+            # "old_log_probs",
             "advantages",
         ]
+        if not self.on_policy:
+            select_keys.append("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -411,7 +415,10 @@ class MegatronPPOActor(BasePPOActor):
             ret_entropy = None
             stats = {}
             if not forward_only:
-                old_log_prob = data["old_log_probs"]
+                if self.on_policy:
+                    old_log_prob = log_prob.detach()
+                else:
+                    old_log_prob = data["old_log_probs"]
                 advantages = data["advantages"]
 
                 clip_ratio = self.config.clip_ratio
@@ -464,6 +471,9 @@ class MegatronPPOActor(BasePPOActor):
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                     entropy_coeff = meta_info["entropy_coeff"]
                     policy_loss = pg_loss - entropy_coeff * entropy_loss
+
+                    if self.on_policy:
+                        metrics["actor/entropy"] = entropy_loss.detach().item()
                 else:
                     ret_entropy = entropy
 
@@ -630,7 +640,7 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            calculate_entropy = self.config.entropy_coeff != 0 or self.on_policy
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:
