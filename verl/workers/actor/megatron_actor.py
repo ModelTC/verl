@@ -510,8 +510,8 @@ class MegatronPPOActor(BasePPOActor):
 
             multi_modal_inputs = {}
             if "multi_modal_inputs" in batch:
-                for key in batch["multi_modal_inputs"][0].keys():
-                    idxs = batch["multi_modal_inputs_idx"]
+                idxs = batch["multi_modal_inputs_idx"]
+                for key in batch["multi_modal_inputs"][idxs[0]].keys():
                     mmi = batch["multi_modal_inputs"]
                     multi_modal_inputs[key] = torch.cat(
                         [mmi[idx].get(key) for idx in idxs if mmi[idx].get(key) is not None], dim=0

@@ -22,8 +22,7 @@ from verl import DataProto
 from .sequence_parallel import pad_to_sequence_parallel
 
 from PIL import Image
-from verl.utils.dataset.image_processors import bytes_to_pil
-from verl.utils.dataset.image_processors import preprocess_images_internvl
+from verl.utils.dataset.image_processors import bytes_to_pil, base64_to_pil, preprocess_images_internvl
 from functools import partial
 
 
@@ -113,6 +112,8 @@ class PrefetchDataset(torch.utils.data.Dataset):
                 return image_item
             elif isinstance(image_item, bytes):
                 return bytes_to_pil(image_item)
+            elif isinstance(image_item, str):
+                return base64_to_pil(image_item)
             else:
                 raise ValueError(f"Unsupported image type: {type(image_item)}")
 

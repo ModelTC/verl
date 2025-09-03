@@ -42,23 +42,11 @@ from PIL import Image
 from sandbox_fusion import run_jupyter_async, RunJupyterRequest
 
 from verl.utils.dataset.image_processors import adaptive_resize_image, preprocess_images_internvl, preprocess_images_qwenvl, pil_to_bytes
+from verl.utils.dataset.image_processors import base64_to_pil, pil_to_base64
+
 
 def repeat_each(lst, n):
     return [x for x in lst for _ in range(n)]
-
-
-def base64_to_pil(image_base64):
-    image_data = base64.b64decode(image_base64)
-    image_io = io.BytesIO(image_data)
-    image = Image.open(image_io)
-    return image
-
-
-def pil_to_base64(image):
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")  # You can change the format if needed, e.g., "JPEG"
-    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return image_base64
 
 
 class ToolChatCompletionScheduler(ChatCompletionScheduler):
@@ -98,14 +86,13 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             token_ids_for_gen = token_ids
 
         elif isinstance(message['content'], list):
-            images = []
+            image_wh = []
             text = ''
             for part in message['content']:
                 assert isinstance(part, dict), f'part: {part}'
                 if part['type'] == "image_url":
-                    image_base64 = part['image_url']['url'].split("base64,")[1]
-                    image = base64_to_pil(image_base64)
-                    images.append(image)
+                    wh = (part['image_url']['w'], part['image_url']['h'])
+                    image_wh.append(wh)
                 elif part['type'] == "text":
                     text += part['text']
 
@@ -113,7 +100,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 [{'role': message['role'], 'content': text}], add_generation_prompt=False, tokenize=True
             )
 
-            text = self._add_image_tokens_to_text(text, images)
+            text = self._add_image_tokens_to_text(text, image_wh, image_wh=image_wh)
             new_message = {'role': message['role'], 'content': text}
             token_ids = self.tokenizer.apply_chat_template(
                 [new_message], add_generation_prompt=False, tokenize=True
@@ -240,16 +227,19 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                             image = base64_to_pil(item['image/png'])
                             image = self._process_image(image)
                             image_base64 = pil_to_base64(image)
-                            
+                            wh = Image.open(io.BytesIO(base64.b64decode(image_base64))).size
                             images.append({
                                 "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                                "image_url": {"url": f"data:image/png;base64,{image_base64}",
+                                              "w": wh[0],
+                                              "h": wh[1]}
                             })
                             texts.append(self.image_tag)
                         if 'text/plain' in item:
                             texts.append(item['text/plain'])
                     except Exception as e:
                         # 如果单个 display item 处理失败，跳过它，而不是中断整个流程
+                        print(e)
                         continue
                 
                 # 将收集到的文本和图片组装成最终的 content 格式
@@ -418,8 +408,9 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 if isinstance(message['content'], list):
                     for part in message['content']:
                         if 'image_url' in part:
-                            image_base64 = part['image_url']['url'].split("base64,")[1]
-                            image = base64_to_pil(image_base64)
+                            image = part['image_url']['url'].split("base64,")[1]
+                            if not self.data_config.get('use_image_bytes', False):
+                                image = base64_to_pil(image)
                             whole_images.append(image)
 
             batch_resp_ids.append(resp_ids)
@@ -427,11 +418,10 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             batch_logps.append(logprobs)
 
             if self.data_config.get('use_image_bytes', False):
-                multi_modal_data.append({"image": [pil_to_bytes(image) for image in whole_images]})
+                multi_modal_data.append({"image": whole_images})
             else:
                 image_inputs = self._build_multi_modal_input(whole_images)
                 multi_modal_inputs.append(image_inputs)
-
         # prompts: [prompt] from input dataset
         prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
         prompts = self.tokenizer(prompts, return_tensors="pt", padding="max_length", max_length=self.max_prompt_length, padding_side="left")
@@ -482,11 +472,11 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
     
 
-    def _add_image_tokens_to_text(self, text, images):
+    def _add_image_tokens_to_text(self, text, images=None, image_wh=None):
         """
         Add image tokens to the text based on the number of images.
         """
-        _, text = self.preprocess_images_fn(images=images, text=text)
+        _, text = self.preprocess_images_fn(images=images, text=text, image_wh=image_wh)
         return text
     
     def _build_multi_modal_input(self, images):
@@ -550,7 +540,7 @@ class ToolChatCompletionScheduler_InternVL(ToolChatCompletionScheduler):
             use_thumbnail=internvl_config['use_thumbnail'], 
             num_image_token=int((image_size // patch_size)**2 * (downsample_ratio**2))
         )
-
+        
     def _get_position_ids(self, input_ids, attention_mask, multi_modal_inputs):
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
         return position_ids
