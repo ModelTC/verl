@@ -312,7 +312,10 @@ class MegatronPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
-            data = data.select(select_keys, ["multi_modal_inputs"])
+            if "multi_modal_data" in data.non_tensor_batch.keys():
+                data = data.select(select_keys, ["multi_modal_inputs", "multi_modal_data"])
+            else:
+                data = data.select(select_keys, ["multi_modal_inputs"])
         else:
             data = data.select(batch_keys=select_keys)
         return data.make_iterator(
@@ -354,6 +357,8 @@ class MegatronPPOActor(BasePPOActor):
             mini_batch.batch["multi_modal_inputs_idx"] = torch.Tensor(
                 list(range(len(mini_batch.non_tensor_batch["multi_modal_inputs"])))
             ).to(torch.int64)
+        if "multi_modal_data" in mini_batch.non_tensor_batch.keys():
+            mini_batch.batch["multi_modal_data"] = mini_batch.non_tensor_batch["multi_modal_data"]
 
         if mini_batch.batch["position_ids"].dim() == 3:  # qwen2vl mrope [bs, 3, seq_len]
             mini_batch.batch["position_ids"] = mini_batch.batch["position_ids"][
@@ -497,6 +502,8 @@ class MegatronPPOActor(BasePPOActor):
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
+            batch = batch.to(get_device_id())
+
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
             position_ids = batch["position_ids"]
@@ -581,7 +588,7 @@ class MegatronPPOActor(BasePPOActor):
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
         # batch should be a list of batches inside micro-batches
-        batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
+        batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module), hf_config=self.hf_config)
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
