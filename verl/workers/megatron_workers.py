@@ -546,12 +546,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 if 'image' in multi_modal_data:
                     images = [image_convert(image_item) for image_item in multi_modal_data['image']]
                     image_inputs, _ = preprocess_images_fn(images=images)
-                    data.non_tensor_batch['multi_modal_inputs'][item_idx].update(image_inputs)
+                    data.non_tensor_batch['multi_modal_inputs'][item_idx] = image_inputs
                 else:
-                    data.non_tensor_batch['multi_modal_inputs'][item_idx].update({
+                    data.non_tensor_batch['multi_modal_inputs'][item_idx] = {
                         'pixel_values': torch.zeros(1, 3, image_size, image_size), 
                         'image_flags': torch.zeros(1, dtype=torch.long)
-                    })
+                    }
 
             self.multi_modal_buffer = data.non_tensor_batch['multi_modal_inputs']
 

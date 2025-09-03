@@ -426,9 +426,11 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             batch_loss_mask.append(loss_mask)
             batch_logps.append(logprobs)
 
-            image_inputs = self._build_multi_modal_input(whole_images)
-            multi_modal_inputs.append(image_inputs)
-            multi_modal_data.append({"image": [pil_to_bytes(image) for image in whole_images]})
+            if self.data_config.get('use_image_bytes', False):
+                multi_modal_data.append({"image": [pil_to_bytes(image) for image in whole_images]})
+            else:
+                image_inputs = self._build_multi_modal_input(whole_images)
+                multi_modal_inputs.append(image_inputs)
 
         # prompts: [prompt] from input dataset
         prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
@@ -468,9 +470,9 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         )
 
         if self.data_config.get('use_image_bytes', False):
-            multi_modal_inputs = [{}] * len(multi_modal_inputs)
+            multi_modal_inputs = [{}] * len(batch)
         else:
-            multi_modal_data = [{}] * len(multi_modal_data)
+            multi_modal_data = [{}] * len(batch)
 
         non_tensor_batch = {
             "multi_modal_inputs": np.array(multi_modal_inputs, dtype=object),
