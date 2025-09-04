@@ -224,10 +224,21 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                     try:
                         if "image/png" in item:
                             # 图像处理逻辑
-                            image = base64_to_pil(item['image/png'])
-                            image = self._process_image(image)
-                            image_base64 = pil_to_base64(image)
-                            wh = Image.open(io.BytesIO(base64.b64decode(image_base64))).size
+                            process = False
+                            if hasattr(self, "_need_process"):
+                                wh = Image.open(io.BytesIO(base64.b64decode(item['image/png']))).size
+                                if self._need_process(wh[0], wh[1]):
+                                    process = True
+                            else:
+                                process = True
+                            if process:
+                                image = base64_to_pil(item['image/png'])
+                                image = self._process_image(image)
+                                image_base64 = pil_to_base64(image)
+                                wh = Image.open(io.BytesIO(base64.b64decode(image_base64))).size
+                            else:
+                                image_base64 = item['image/png']
+                            
                             images.append({
                                 "type": "image_url",
                                 "image_url": {"url": f"data:image/png;base64,{image_base64}",
@@ -548,6 +559,12 @@ class ToolChatCompletionScheduler_InternVL(ToolChatCompletionScheduler):
     def _process_image(self, image):
         image = adaptive_resize_image(image, max_aspect_ratio=200)
         return image
+    
+    def _need_process(self, w, h, max_aspect_ratio=200):
+        longer, shorter = max(w, h), min(w, h)
+        if longer / shorter > max_aspect_ratio:
+            return True
+        return False
 
 class ToolChatCompletionScheduler_QwenVL(ToolChatCompletionScheduler):
     """
