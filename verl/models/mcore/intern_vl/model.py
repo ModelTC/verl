@@ -71,6 +71,9 @@ class InternVLModel(MegatronModule):
         
         self.encoder_hidden_state = None
         self.select_layer = vision_transformer_config.select_layer
+
+        self.vision_model = None
+        self.mlp1 = None
         
         self.share_embeddings_and_output_weights = False
         if self.pre_process:
@@ -274,3 +277,25 @@ class InternVLModel(MegatronModule):
         )
 
         return output
+
+    def freeze(self, freeze_language_model: bool, freeze_vision_model: bool, freeze_mlp: bool):
+        """Freeze model modules.
+
+        Make specific modules non-trainable by setting requires_grad to False for the module's parameters.
+
+        Args:
+            freeze_language_model (bool): Freeze the language model module.
+            freeze_vision_model (bool): Freeze the vision model module.
+            freeze_mlp (bool): Freeze the vision projection module.
+        """
+        modules = []
+        if freeze_language_model and self.language_model is not None:
+            modules.append(self.language_model)
+        if freeze_vision_model and self.vision_model is not None:
+            modules.append(self.vision_model)
+        if freeze_mlp and self.mlp1 is not None:
+            modules.append(self.mlp1)
+
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False

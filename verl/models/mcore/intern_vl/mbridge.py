@@ -181,6 +181,11 @@ class InternVLBridge(VLMBridge):
                 img_context_token_id=hf_config.img_context_token_id,
             )
 
+            freeze_language_model = getattr(hf_config, "freeze_language_model", False)
+            freeze_vision_model = getattr(hf_config, "freeze_vision_model", False)
+            freeze_mlp = getattr(hf_config, "freeze_mlp", False)
+            model.freeze(freeze_language_model, freeze_vision_model, freeze_mlp)
+
             for callback in post_model_creation_callbacks:
                 callback(model)
 
