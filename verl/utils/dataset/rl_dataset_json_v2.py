@@ -4,6 +4,7 @@ import json
 from transformers import PreTrainedTokenizer, ProcessorMixin
 import torch
 import random
+random.seed(42)
 from PIL import UnidentifiedImageError
 
 import copy
