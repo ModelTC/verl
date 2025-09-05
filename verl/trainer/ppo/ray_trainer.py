@@ -1315,6 +1315,7 @@ class RayPPOTrainer:
                                     ray.cancel(future, force=True)
                                 rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                                 if rollout_data_dir:
+                                    os.makedirs(rollout_data_dir, exist_ok=True)
                                     batch.save_to_disk(f"{rollout_data_dir}/reward_timeout_data_step{self.global_steps}.pkl")
                                 continue
                             key2len = {}
