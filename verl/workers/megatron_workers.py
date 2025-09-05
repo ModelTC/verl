@@ -123,7 +123,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
             if self.config.actor.megatron.get("vision_tensor_model_parallel_size", None):
                 assert self.config.actor.megatron.vision_tensor_model_parallel_size == 1, \
-                    "vision_tensor_model_parallel_size must be 1 for now"
+                    "vision_tensor_model_parallel_size must be 1 for separate vision tp"
+                assert self.config.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage == 0, \
+                    "num_layers_in_first_pipeline_stage must be 0 for separate vision tp"
                 init_vision_tp(self.config)
 
         set_random_seed(seed=self.config.actor.megatron.seed)
