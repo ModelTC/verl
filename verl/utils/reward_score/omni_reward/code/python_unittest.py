@@ -30,9 +30,14 @@ async def sandbox_run_jupyter(
             max_attempts=max_attempts,
             client_timeout=(timeout * max_attempts + 5),
         )
-        return resp.cells[-1]
     except Exception as e:
         print(f"sandbox exception: {e}, {type(e)=}")
+        return
+
+    if resp.cells:
+        return resp.cells[-1]
+    else:
+        print("[python_unittest] Warning: no cells in response")
         return
     
 async def sandbox_run_code(

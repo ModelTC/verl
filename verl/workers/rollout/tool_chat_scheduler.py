@@ -124,9 +124,14 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 max_attempts=max_attempts,
                 client_timeout=timeout+30,
             )
-            return resp.cells[-1]
         except Exception as e:
             print(f"sandbox exception: {e}, {type(e)=}")
+            return
+
+        if resp.cells:
+            return resp.cells[-1]
+        else:
+            print("[ToolChatCompletionScheduler] Warning: no cells in response")
             return
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
