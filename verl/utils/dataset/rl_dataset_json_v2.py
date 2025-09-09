@@ -263,7 +263,6 @@ class RLHFJSONDataset(RLHFDataset):
         """
         row_dict: dict = copy.deepcopy(self.dataframe[item])
         preprocess_fn = self._internvl_preprocess if self.apply_internvl_preprocess else self._default_preprocess
-
         try:
             return preprocess_fn(row_dict)
         except Exception as e:
@@ -280,14 +279,14 @@ class RLHFJSONDataset(RLHFDataset):
                 elif segment == "<image>":
                     image = images.pop(0)
                     img_byte_arr = io.BytesIO()
-                    image.save(img_byte_arr, format='JPEG')
+                    image.save(img_byte_arr, format='PNG')
                     img_byte_arr = img_byte_arr.getvalue()
                     img_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
                     
                     content_list.append({
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_base64}"
+                            "url": f"data:image/png;base64,{img_base64}"
                         },
                     })
                 else:
@@ -298,7 +297,6 @@ class RLHFJSONDataset(RLHFDataset):
         assert len(images) == 0
 
         return messages
-
 
 
     @use_image_bytes
