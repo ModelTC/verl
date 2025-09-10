@@ -306,6 +306,9 @@ class MegatronPPOActor(BasePPOActor):
             # "old_log_probs",
             "advantages",
         ]
+        if self.config.tis_imp_ratio_cap > 0:
+            assert "rollout_log_probs" in data.batch.keys()
+            select_keys.append("rollout_log_probs")
         if not self.on_policy:
             select_keys.append("old_log_probs")
         if self.config.use_kl_loss:
@@ -425,6 +428,7 @@ class MegatronPPOActor(BasePPOActor):
                 else:
                     old_log_prob = data["old_log_probs"]
                 advantages = data["advantages"]
+                rollout_log_probs = data["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
 
                 clip_ratio = self.config.clip_ratio
                 clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -437,7 +441,7 @@ class MegatronPPOActor(BasePPOActor):
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                 if self.config.policy_loss.loss_mode == "vanilla":
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                    ret = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -447,7 +451,13 @@ class MegatronPPOActor(BasePPOActor):
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_log_probs=rollout_log_probs,
                     )
+                    if self.config.tis_imp_ratio_cap > 0:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean = ret
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = ret
 
                 else:
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
@@ -468,6 +478,8 @@ class MegatronPPOActor(BasePPOActor):
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
                 )
+                if self.config.tis_imp_ratio_cap > 0:
+                    stats["actor/tis_imp_ratio_mean"] = tis_imp_ratio_mean.detach().item()
                 policy_loss = pg_loss
 
             if calculate_entropy:
