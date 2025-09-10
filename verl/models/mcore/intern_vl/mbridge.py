@@ -405,6 +405,120 @@ class InternVLBridge(VLMBridge):
 
         return ret
 
+
+    def _weight_merge_across_tp(
+        self,
+        mcore_weights_name: str,
+        mcore_weights: list[torch.Tensor],
+        param: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Merge weights across tensor parallel ranks.
+        In mcore format
+
+        Args:
+            mcore_weights_name: MCore weight name
+            mcore_weights: List of MCore weight tensors from different TP ranks
+            param: Parameter tensor
+
+        Returns:
+            torch.Tensor: Merged weight tensor
+        """
+        if self.mpu.tp_size == 1:
+            assert len(mcore_weights) == 1
+            return mcore_weights[0]
+        if "mlp.experts.linear_fc" in mcore_weights_name:
+            assert len(mcore_weights) == self.mpu.etp_size
+        else:
+            assert len(mcore_weights) == self.mpu.tp_size
+        if (
+            "self_attention.linear_qkv." in mcore_weights_name
+            and "layer_norm" not in mcore_weights_name
+        ):
+            return torch.cat(mcore_weights, dim=0)
+        elif (
+            "linear_fc1.weight" in mcore_weights_name
+            or "linear_fc1.bias" in mcore_weights_name
+        ):
+
+            if 'vision_model' in mcore_weights_name or 'mlp1' in mcore_weights_name:
+                ret = torch.cat(mcore_weights, dim=0)
+            else:
+                # if the tensor is gate and proj
+                gate_lst = []
+                up_lst = []
+                for mcore_weight in mcore_weights:
+                    gate, up = mcore_weight.chunk(2)
+                    gate_lst.append(gate)
+                    up_lst.append(up)
+                gate = torch.cat(gate_lst, dim=0)
+                up = torch.cat(up_lst, dim=0)
+                ret = torch.cat((gate, up), dim=0)
+
+        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
+            ret = torch.cat(mcore_weights, dim=1)
+        else:
+            assert (
+                hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
+            )
+            ret = torch.cat(mcore_weights, dim=param.partition_dim)
+
+        return ret
+
+    def _weight_split_across_tp(
+        self,
+        mcore_weights_name: str,
+        mcore_weights: torch.Tensor,
+        param: torch.Tensor,
+        tp_split_size: int,
+    ) -> list[torch.Tensor]:
+        """
+        Split weight tensor across tensor parallel ranks.
+
+        Args:
+            mcore_weights_name: MCore weight name
+            mcore_weights: MCore weight tensor
+            param: Parameter tensor
+
+        Returns:
+            list: List of weight tensors split for each TP rank
+        """
+        if tp_split_size == 1:
+            return [mcore_weights]
+
+        if (
+            "self_attention.linear_qkv." in mcore_weights_name
+            and "layer_norm" not in mcore_weights_name
+        ):
+            return mcore_weights.chunk(tp_split_size)
+        elif (
+            "linear_fc1.weight" in mcore_weights_name
+            or "linear_fc1.bias" in mcore_weights_name
+        ):
+
+            if 'vision_model' in mcore_weights_name or 'mlp1' in mcore_weights_name:
+                ret = mcore_weights.chunk(tp_split_size)
+            else:
+                gate, up = mcore_weights.chunk(2)
+                gates = gate.chunk(tp_split_size)
+                ups = up.chunk(tp_split_size)
+                ret = [torch.cat([g, u], dim=0) for g, u in zip(gates, ups)]
+        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
+            ret = mcore_weights.chunk(tp_split_size, dim=1)
+        else:
+            if param.shape == mcore_weights.shape:
+                return [mcore_weights for _ in range(tp_split_size)]
+            assert len(param.shape) == len(mcore_weights.shape)
+            for partition_dim, (s1, s2) in enumerate(
+                zip(param.shape, mcore_weights.shape)
+            ):
+                if s1 != s2:
+                    break
+
+            ret = mcore_weights.chunk(tp_split_size, dim=partition_dim)
+        return ret
+
+
     def _build_config(self):
         """
         Build the configuration for InternVL models.
