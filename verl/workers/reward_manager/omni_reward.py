@@ -55,11 +55,11 @@ class OmniRewardManager:
             response_str = self.tokenizer.decode(valid_response_ids).replace(IMG_CONTEXT_TOKEN_QWEN, "").replace(PAD_TOKEN, "").replace(IMG_CONTEXT_TOKEN, "")
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
-            print(f"[prompt]:{prompt_str}")
-            print(f"[response]:{response_str}")
-            print(f"[ground_truth]:{ground_truth}")
-            if score is not None:
-                print(f"[score]:{score}")
+            # print(f"[prompt]:{prompt_str}")
+            # print(f"[response]:{response_str}")
+            # print(f"[ground_truth]:{ground_truth}")
+            # if score is not None:
+            #     print(f"[score]:{score}")
 
 
         def _process_item(args):
