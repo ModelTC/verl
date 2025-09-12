@@ -276,6 +276,11 @@ class InternVLBridge(VLMBridge):
             NotImplementedError: If the parameter name is unsupported
         """
         hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
+
+        if 'vision_model' in mcore_weights_name:
+            if 'self_attention.linear_qkv.' in mcore_weights_name:
+                hf_names = hf_names * 3
+
         if len(hf_names) == 1:
             return [hf_names[0]], [mcore_weights]
         if ("self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name):
@@ -285,11 +290,13 @@ class InternVLBridge(VLMBridge):
             num_key_value_heads = getattr(self.hf_config.llm_config, "num_key_value_heads", 32)
             hidden_dim = getattr(self.hf_config.llm_config, "hidden_size", 4096)
             num_attention_heads = getattr(self.hf_config.llm_config, "num_attention_heads", 32)
-
-            if "vision_model" in mcore_weights_name:
-                num_attention_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
-                num_key_value_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
             head_dim = getattr(self.hf_config.llm_config, "head_dim", hidden_dim // num_attention_heads)
+            if "vision_model" in mcore_weights_name:
+                num_attention_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                num_key_value_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                hidden_dim = getattr(self.hf_config.vision_config, "hidden_size", 1536)
+                head_dim = getattr(self.hf_config.vision_config, "head_dim", hidden_dim // num_attention_heads) # 1536 / 16 = 96
+
             out_shape = ([num_key_value_heads, -1, hidden_dim] if ".bias" not in mcore_weights_name else [num_key_value_heads, -1])
             qkv = mcore_weights.view(*out_shape)
             q_len = head_dim * num_attention_heads // num_key_value_heads
@@ -299,7 +306,12 @@ class InternVLBridge(VLMBridge):
             q = qkv[:, :q_len].reshape(*single_out_shape)
             k = qkv[:, q_len:q_len + k_len].reshape(*single_out_shape)
             v = qkv[:, q_len + k_len:].reshape(*single_out_shape)
-            return hf_names, [q, k, v]
+
+            if 'vision_model' in mcore_weights_name:
+                qkv = torch.cat([q, k, v], dim=0)
+                return [hf_names[0]], [qkv]
+            else:
+                return hf_names, [q, k, v]
 
         elif ("linear_fc1.weight" in mcore_weights_name or "linear_fc1.bias" in mcore_weights_name):
             # split gate_proj and up_proj
@@ -325,6 +337,10 @@ class InternVLBridge(VLMBridge):
         Raises:
             NotImplementedError: If the parameter name is unsupported
         """
+        if 'vision_model' in mcore_weights_name:
+            if 'self_attention.linear_qkv.' in mcore_weights_name:
+                hf_weights = hf_weights[0].chunk(3)
+
         if len(hf_weights) == 1:
             return hf_weights[0]
         if ("self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name):
@@ -333,10 +349,13 @@ class InternVLBridge(VLMBridge):
             num_key_value_heads = getattr(self.hf_config.llm_config, "num_key_value_heads", 32)
             hidden_dim = getattr(self.hf_config.llm_config, "hidden_size", 4096)
             num_attention_heads = getattr(self.hf_config.llm_config, "num_attention_heads", 32)
-            if "vision_model" in mcore_weights_name:
-                num_attention_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
-                num_key_value_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
             head_dim = getattr(self.hf_config.llm_config, "head_dim", hidden_dim // num_attention_heads)
+            if "vision_model" in mcore_weights_name:
+                num_attention_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                num_key_value_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                hidden_dim = getattr(self.hf_config.vision_config, "hidden_size", 1536)
+                head_dim = getattr(self.hf_config.vision_config, "head_dim", hidden_dim // num_attention_heads)
+
             group_dim = head_dim * num_attention_heads // num_key_value_heads
             q, k, v = hf_weights
             # q k v might be tp split

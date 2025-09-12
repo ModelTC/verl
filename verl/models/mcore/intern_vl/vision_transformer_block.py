@@ -86,6 +86,8 @@ class InternVisionTransformerBlock(TransformerBlock):
         
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
+
+        hidden_states = hidden_states.transpose(0, 1).contiguous()
         
         # for idx, encoder_layer in enumerate(self.layers):
         #     if output_hidden_states:
@@ -124,7 +126,9 @@ class InternVisionTransformerBlock(TransformerBlock):
                 custom(layer_idx, layer_idx + recompute_num_layers)
             )
             layer_idx += recompute_num_layers
-            
+
+        hidden_states = hidden_states.transpose(0, 1).contiguous()
+
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
             
