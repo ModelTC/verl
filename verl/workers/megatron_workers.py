@@ -121,6 +121,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 nccl_communicator_config_path=None,
             )
 
+            from verl.utils.megatron_utils import print_node_to_rank_mapping
+            print_node_to_rank_mapping()
+
             if self.config.actor.megatron.get("vision_tensor_model_parallel_size", None):
                 assert self.config.actor.megatron.vision_tensor_model_parallel_size == 1, \
                     "vision_tensor_model_parallel_size must be 1 for separate vision tp"
