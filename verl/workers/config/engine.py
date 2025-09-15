@@ -68,6 +68,7 @@ class McoreEngineConfig(BaseConfig):
     override_ddp_config: dict[str, Any] = field(default_factory=dict)
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
     use_mbridge: bool = False
+    vision_tensor_model_parallel_size: Optional[int] = None
 
     def __post_init__(self) -> None:
         """config validation logics go here"""

@@ -20,6 +20,8 @@ import gc
 import os
 import warnings
 from typing import Any
+import socket
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -1015,3 +1017,53 @@ def get_transformer_layer_offset(pipeline_rank, vp_rank, config: TransformerConf
     else:
         offset = 0
     return offset
+
+
+def print_node_to_rank_mapping():
+    assert torch.distributed.is_initialized(), "Distributed is not initialized"
+
+    global_rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    hostname = socket.gethostname()
+
+    rank_info = {
+        "global_rank": global_rank,
+        "hostname": hostname,
+        "tp_rank": mpu.get_tensor_model_parallel_rank(),
+        "tp_ws": mpu.get_tensor_model_parallel_world_size(),
+        "pp_rank": mpu.get_pipeline_model_parallel_rank(),
+        "pp_ws": mpu.get_pipeline_model_parallel_world_size(),
+        "dp_rank": mpu.get_data_parallel_rank(),
+        "dp_ws": mpu.get_data_parallel_world_size(),
+        "cp_rank": mpu.get_context_parallel_rank(),
+        "cp_ws": mpu.get_context_parallel_world_size(),
+        "ep_rank": mpu.get_expert_model_parallel_rank(),
+        "ep_ws": mpu.get_expert_model_parallel_world_size(),
+    }
+
+    all_rank_info = [None] * world_size
+    torch.distributed.all_gather_object(all_rank_info, rank_info)
+
+    if global_rank == 0:
+        all_rank_info.sort(key=lambda x: x["global_rank"])
+
+        print("="*80)
+        print("Rank Parallelism Info (sorted by global rank):")
+        
+        current_hostname = None
+        for info in all_rank_info:
+            if info["hostname"] != current_hostname:
+                current_hostname = info["hostname"]
+                # Get all ranks for this node to print the header
+                ranks_on_node = [r['global_rank'] for r in all_rank_info if r['hostname'] == current_hostname]
+                print(f"\n  Node '{current_hostname}': {len(ranks_on_node)} ranks -> {ranks_on_node}")
+            
+            print(
+                f"    global_rank: {info['global_rank']:<3} | "
+                f"tp: {info['tp_rank']}/{info['tp_ws']} | "
+                f"cp: {info['cp_rank']}/{info['cp_ws']} | "
+                f"ep: {info['ep_rank']}/{info['ep_ws']} | "
+                f"dp: {info['dp_rank']}/{info['dp_ws']} | "
+                f"pp: {info['pp_rank']}/{info['pp_ws']} "
+            )
+        print("="*80)

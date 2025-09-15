@@ -62,6 +62,10 @@ def main():
         from .megatron_model_merger import MegatronModelMerger
 
         merger = MegatronModelMerger(config)
+    elif config.backend == "megatron_mbridge":
+        from .megatron_mbridge_model_merger import MegatronMBridgeModelMerger
+
+        merger = MegatronMBridgeModelMerger(config)
     else:
         raise NotImplementedError(f"Unknown backend: {config.backend}")
 

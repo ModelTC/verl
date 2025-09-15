@@ -1,3 +1,4 @@
+import base64
 from io import BytesIO
 import math
 import torch
@@ -84,13 +85,14 @@ def preprocess_images_internvl(
     use_thumbnail: bool = True,
     num_image_token: int = 256,
     text: Optional[str] = None,
+    image_wh = None
 ) -> Tuple[Dict[str, torch.Tensor], Optional[str]]:
     """
     Preprocess a batch of images for InternVL:
     - Dynamically generate patches for each image.
     - Stack all patch tensors into a single pixel_values tensor.
     - Create an image_flags tensor of ones.
-    - Replace each '<image>' placeholder in `text` with
+    - Replace each '<img></img>' placeholder in `text` with
       IMG_START_TOKEN + repeated IMG_CONTEXT_TOKEN + IMG_END_TOKEN,
       where the repetition count = num_patches_for_that_image * num_image_token.
 
@@ -101,49 +103,59 @@ def preprocess_images_internvl(
         image_size: Target size for each patch.
         use_thumbnail: If True, use thumbnail mode in dynamic preprocessing.
         num_image_token: Number of text tokens reserved per patch.
-        text: Optional input string containing '<image>' placeholders.
+        text: Optional input string containing '<img></img>' placeholders.
 
     Returns:
         Tuple of:
             image_inputs: dict with keys
                 - 'pixel_values': Tensor of shape (total_patches, 3, H, W)
                 - 'image_flags':   Tensor of shape (total_patches,)
-            updated_text: the input `text` with '<image>' replaced,
+            updated_text: the input `text` with '<img></img>' replaced,
                           or None if `text` was None.
     """
     num_images = len(images)
 
     # Validate placeholder count matches actual images
     if text is not None:
-        placeholder_count = text.count('<image>')
+        placeholder_count = text.count('<img></img>')
         if placeholder_count != num_images:
             raise ValueError(
-                f"Found {placeholder_count} '<image>' tokens but received {num_images} images."
+                f"Found {placeholder_count} '<img></img>' tokens but received {num_images} images."
             )
 
     if num_images > 0:
         # 1) Generate and collect patches
         all_patches = []
         patches_per_image = []
-        for img in images:
-            patches = dynamic_preprocess_v4(
-                img,
-                min_num=min_dynamic_patch,
-                max_num=max(max_dynamic_patch, 1),
-                image_size=image_size,
-                use_thumbnail=use_thumbnail
-            )
-            patches_per_image.append(len(patches))
-            all_patches.extend(patches)
+        if image_wh is not None:
+            for wh in image_wh:
+                n_patches = get_image_patch_v4(wh[0],
+                                               wh[1],
+                                               min_num=min_dynamic_patch,
+                                               max_num=max(max_dynamic_patch, 1),
+                                               image_size=image_size,
+                                               use_thumbnail=use_thumbnail)
+                patches_per_image.append(n_patches)
+        else:
+            for img in images:
+                patches = dynamic_preprocess_v4(
+                    img,
+                    min_num=min_dynamic_patch,
+                    max_num=max(max_dynamic_patch, 1),
+                    image_size=image_size,
+                    use_thumbnail=use_thumbnail
+                )
+                patches_per_image.append(len(patches))
+                all_patches.extend(patches)
 
         # 2) Stack into pixel_values tensor
-        pixel_values = torch.stack(all_patches)  # shape: (total_patches, 3, H, W)
-        image_flags = torch.ones(pixel_values.size(0), dtype=torch.long)
+                pixel_values = torch.stack(all_patches)  # shape: (total_patches, 3, H, W)
+                image_flags = torch.ones(pixel_values.size(0), dtype=torch.long)
 
-        image_inputs = {
-            'pixel_values': pixel_values,
-            'image_flags': image_flags
-        }
+                image_inputs = {
+                    'pixel_values': pixel_values,
+                    'image_flags': image_flags
+                }
 
         # 3) Replace placeholders in text, if provided
         updated_text = text
@@ -154,7 +166,9 @@ def preprocess_images_internvl(
                     IMG_CONTEXT_TOKEN * (n_patches * num_image_token) +
                     IMG_END_TOKEN
                 )
-                updated_text = updated_text.replace('<image>', token_seq, 1)
+                updated_text = updated_text.replace('<img></img>', token_seq, 1)
+        if image_wh is not None:
+            return None, updated_text
 
     else:
         # No images: return a dummy tensor and zero flags
@@ -232,3 +246,28 @@ def preprocess_images_qwenvl(
     image_inputs['image_flags'] = torch.tensor([1] * image_inputs['pixel_values'].size(0), dtype=torch.long) * int(num_images > 0)
         
     return image_inputs, updated_text
+
+
+def bytes_to_pil(image_bytes):
+    image_io = BytesIO(image_bytes)
+    image = Image.open(image_io)
+    return image
+
+
+def pil_to_bytes(image, format="PNG"):
+    buffered = BytesIO()
+    image.save(buffered, format=format)  # You can change the format if needed, e.g., "JPEG"
+    return buffered.getvalue()
+
+def base64_to_pil(image_base64):
+    image_data = base64.b64decode(image_base64)
+    image_io = BytesIO(image_data)
+    image = Image.open(image_io)
+    return image
+
+
+def pil_to_base64(image):
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")  # You can change the format if needed, e.g., "JPEG"
+    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return image_base64

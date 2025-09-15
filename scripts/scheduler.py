@@ -5,8 +5,8 @@ import asyncio
 from aiohttp import web, ClientSession
 
 #BACKEND_SERVERS = ["http://10.119.30.142:8080", "http://10.119.30.142:8081"]
-MAX_CONCURRENT = 64     
-TIMEOUTS = [30, 30]   # 3级超时时间，秒
+MAX_CONCURRENT = 1024    
+TIMEOUTS = [60, 60]   # 3级超时时间，秒
 
 
 def extract_ips(file_path, world_size):
@@ -110,7 +110,7 @@ print(BACKEND_SERVERS)
 
 # aiohttp app
 scheduler = Scheduler(BACKEND_SERVERS, MAX_CONCURRENT)
-app = web.Application()
+app = web.Application(client_max_size=2*1024*1024)
 app.router.add_route('*', '/{tail:.*}', scheduler.proxy)
 
 if __name__ == "__main__":

@@ -295,20 +295,30 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
 
         """
+        self.on_policy = len(data.batch) <= self.config.ppo_mini_batch_size and self.config.ppo_epochs == 1
+
         select_keys = [
             "responses",
             "input_ids",
             "attention_mask",
             "response_mask",
             "position_ids",
-            "old_log_probs",
+            # "old_log_probs",
             "advantages",
         ]
+        if self.config.tis_imp_ratio_cap > 0:
+            assert "rollout_log_probs" in data.batch.keys()
+            select_keys.append("rollout_log_probs")
+        if not self.on_policy:
+            select_keys.append("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
-            data = data.select(select_keys, ["multi_modal_inputs"])
+            if "multi_modal_data" in data.non_tensor_batch.keys():
+                data = data.select(select_keys, ["multi_modal_inputs", "multi_modal_data"])
+            else:
+                data = data.select(select_keys, ["multi_modal_inputs"])
         else:
             data = data.select(batch_keys=select_keys)
         return data.make_iterator(
@@ -350,6 +360,8 @@ class MegatronPPOActor(BasePPOActor):
             mini_batch.batch["multi_modal_inputs_idx"] = torch.Tensor(
                 list(range(len(mini_batch.non_tensor_batch["multi_modal_inputs"])))
             ).to(torch.int64)
+        if "multi_modal_data" in mini_batch.non_tensor_batch.keys():
+            mini_batch.batch["multi_modal_data"] = mini_batch.non_tensor_batch["multi_modal_data"]
 
         if mini_batch.batch["position_ids"].dim() == 3:  # qwen2vl mrope [bs, 3, seq_len]
             mini_batch.batch["position_ids"] = mini_batch.batch["position_ids"][
@@ -411,8 +423,12 @@ class MegatronPPOActor(BasePPOActor):
             ret_entropy = None
             stats = {}
             if not forward_only:
-                old_log_prob = data["old_log_probs"]
+                if self.on_policy:
+                    old_log_prob = log_prob.detach()
+                else:
+                    old_log_prob = data["old_log_probs"]
                 advantages = data["advantages"]
+                rollout_log_probs = data["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
 
                 clip_ratio = self.config.clip_ratio
                 clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -425,7 +441,7 @@ class MegatronPPOActor(BasePPOActor):
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                 if self.config.policy_loss.loss_mode == "vanilla":
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                    ret = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -435,7 +451,13 @@ class MegatronPPOActor(BasePPOActor):
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_log_probs=rollout_log_probs,
                     )
+                    if self.config.tis_imp_ratio_cap > 0:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean = ret
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = ret
 
                 else:
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
@@ -456,6 +478,8 @@ class MegatronPPOActor(BasePPOActor):
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
                 )
+                if self.config.tis_imp_ratio_cap > 0:
+                    stats["actor/tis_imp_ratio_mean"] = tis_imp_ratio_mean.detach().item()
                 policy_loss = pg_loss
 
             if calculate_entropy:
@@ -464,6 +488,9 @@ class MegatronPPOActor(BasePPOActor):
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                     entropy_coeff = meta_info["entropy_coeff"]
                     policy_loss = pg_loss - entropy_coeff * entropy_loss
+
+                    if self.on_policy:
+                        metrics["actor/entropy"] = entropy_loss.detach().item()
                 else:
                     ret_entropy = entropy
 
@@ -487,14 +514,16 @@ class MegatronPPOActor(BasePPOActor):
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
+            batch = batch.to(get_device_id())
+
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
             position_ids = batch["position_ids"]
 
             multi_modal_inputs = {}
             if "multi_modal_inputs" in batch:
-                for key in batch["multi_modal_inputs"][0].keys():
-                    idxs = batch["multi_modal_inputs_idx"]
+                idxs = batch["multi_modal_inputs_idx"]
+                for key in batch["multi_modal_inputs"][idxs[0]].keys():
                     mmi = batch["multi_modal_inputs"]
                     multi_modal_inputs[key] = torch.cat(
                         [mmi[idx].get(key) for idx in idxs if mmi[idx].get(key) is not None], dim=0
@@ -571,7 +600,7 @@ class MegatronPPOActor(BasePPOActor):
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
         # batch should be a list of batches inside micro-batches
-        batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
+        batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module), hf_config=self.hf_config)
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
@@ -630,7 +659,7 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            calculate_entropy = self.config.entropy_coeff != 0 or self.on_policy
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:

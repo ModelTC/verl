@@ -8,6 +8,7 @@ from collections import defaultdict
 from verl.utils.dataset.utils import IMG_CONTEXT_TOKEN, PAD_TOKEN, IMG_CONTEXT_TOKEN_QWEN
 from verl.utils.reward_score.omni_reward import compute_score_fns
 from verl.workers.reward_manager import register
+from verl.utils.reward_score.utils import ErrCode
 
 @register("omni")
 class OmniRewardManager:
@@ -54,11 +55,11 @@ class OmniRewardManager:
             response_str = self.tokenizer.decode(valid_response_ids).replace(IMG_CONTEXT_TOKEN_QWEN, "").replace(PAD_TOKEN, "").replace(IMG_CONTEXT_TOKEN, "")
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
-            print(f"[prompt]:{prompt_str}")
-            print(f"[response]:{response_str}")
-            print(f"[ground_truth]:{ground_truth}")
-            if score is not None:
-                print(f"[score]:{score}")
+            # print(f"[prompt]:{prompt_str}")
+            # print(f"[response]:{response_str}")
+            # print(f"[ground_truth]:{ground_truth}")
+            # if score is not None:
+            #     print(f"[score]:{score}")
 
 
         def _process_item(args):
@@ -79,15 +80,19 @@ class OmniRewardManager:
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             reward_fn = compute_score_fns[data_item.non_tensor_batch['reward_model']['reward_fn']]
 
-            score = reward_fn(
-                valid_response_str, 
-                ground_truth, 
-                eos_token=self.tokenizer.eos_token,
-                service_url=self.service_url,
-                data_non_tensor_batch=data_item.non_tensor_batch,
-                tool_penalty=self.tool_penalty,
-                is_val=is_val
-            )
+            try:
+                score = reward_fn(
+                    valid_response_str, 
+                    ground_truth, 
+                    eos_token=self.tokenizer.eos_token,
+                    service_url=self.service_url,
+                    data_non_tensor_batch=data_item.non_tensor_batch,
+                    tool_penalty=self.tool_penalty,
+                    is_val=is_val
+                )
+            except Exception as e:
+                print(f"!!!Error in reward_fn: {e}")
+                score = {"score": 0., "error_code": ErrCode.RUNTIME_ERR}
 
             assert isinstance(score, dict), f"score is not a dict: {score}"
 

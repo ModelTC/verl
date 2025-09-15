@@ -1,10 +1,12 @@
 #!/bin/bash
 set -ex
 
+cp $HOME/aoss.conf ~/aoss.conf
+
 # Set default model path if not provided
 MODEL_PATH=$HOME/models/internvl_1+235b_tool
-train_files=$HOME/data/complex_table_train_v3.2.json
-val_files=$HOME/data/complex_table_test_v2.2.json
+train_files=$HOME/data/general_tool_rl_train_v1.0.0.json
+val_files=$HOME/data/test.json
 
 CODE_DIR=$HOME/verl
 
@@ -75,6 +77,8 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.actor.kl_loss_coef=0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.clip_ratio_low=0.001 \
+    actor_rollout_ref.actor.clip_ratio_high=0.0014 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$INFER_TP \
     actor_rollout_ref.rollout.name=vllm \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.cuda_graph_sizes="[128]" \
@@ -94,10 +98,13 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     +actor_rollout_ref.rollout.invalid_token_ids="[151669]" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((1024 * 20)) \
     reward_model.reward_manager=omni \
     reward_model.launch_reward_fn_async=True \
-    reward_model.reward_fn_parallel_size=$((${num_nodes} * 1)) \
+    reward_model.reward_fn_parallel_size=$((${num_nodes} * 4)) \
     +reward_model.reward_kwargs.log_num_round=True \
+    +reward_model.reward_kwargs.service_url=http://$master_ip:80 \
+    +reward_model.reward_fn_timeout=300 \
     trainer.critic_warmup=0 \
     trainer.val_before_train=$val_before_train \
     trainer.logger=['console','wandb'] \
@@ -105,7 +112,7 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=$num_nodes \
-    trainer.save_freq=50 \
+    trainer.save_freq=20 \
     trainer.test_freq=10 \
     trainer.default_local_dir=$ckpt_dir \
     trainer.rollout_data_dir=$rollout_dir/train \
@@ -116,11 +123,11 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     +actor_rollout_ref.rollout.chat_scheduler_kwargs="{sandbox_address: $master_ip:80, max_turns: 10, use_data_config: True}" \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend=flash \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=2 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=8 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=1 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=3 \
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block \
-    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=14 \
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=15 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_expert_capacity_factor=1.0 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True \
@@ -134,6 +141,5 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.actor.megatron.param_offload=True \
     actor_rollout_ref.actor.megatron.optimizer_offload=True \
     actor_rollout_ref.actor.megatron.grad_offload=True \
+    actor_rollout_ref.actor.policy_loss.loss_mode=gspo_token \
     trainer.total_epochs=15 2>&1 | tee $result_dir/train-$T.log
-
-

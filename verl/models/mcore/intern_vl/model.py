@@ -16,13 +16,11 @@ from megatron.core import tensor_parallel
 
 class _AllGather(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vit_embeds, dim, sp_size, sp_group, sp_rank, image_flags):
+    def forward(ctx, vit_embeds, dim, sp_size, sp_group, sp_rank):
         ctx.dim = dim
         ctx.sp_group = sp_group
         ctx.sp_size = sp_size
         ctx.sp_rank = sp_rank
-        # ctx.image_flags = image_flags
-        ctx.save_for_backward(image_flags)
         vit_embeds_list = [torch.zeros_like(vit_embeds) for _ in range(sp_size)]
         dist.all_gather(vit_embeds_list, vit_embeds, group=sp_group)
         vit_embeds = torch.cat(vit_embeds_list, dim=dim)
@@ -30,18 +28,8 @@ class _AllGather(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        image_flags = ctx.saved_tensors[0]
-        size = image_flags.shape[0]
-        if size != grad_output.shape[0]:
-            _, dim1, dim2 = grad_output.shape
-            pad_grad_output = torch.zeros((size, dim1, dim2),
-                                          dtype=grad_output.dtype,
-                                          device=grad_output.device)
-            pad_grad_output[:grad_output.shape[0]] = grad_output
-            grad_output = pad_grad_output
-
-        grad_output = torch.split(grad_output, size // ctx.sp_size, dim=ctx.dim)
-        return grad_output[ctx.sp_rank].contiguous(),  None, None, None, None, None
+        grad_output = torch.split(grad_output, grad_output.shape[0] // ctx.sp_size, dim=ctx.dim)
+        return grad_output[ctx.sp_rank].contiguous(),  None, None, None, None
 
 
 class InternVLModel(MegatronModule):
@@ -71,6 +59,9 @@ class InternVLModel(MegatronModule):
         
         self.encoder_hidden_state = None
         self.select_layer = vision_transformer_config.select_layer
+
+        self.vision_model = None
+        self.mlp1 = None
         
         self.share_embeddings_and_output_weights = False
         if self.pre_process:
@@ -114,6 +105,13 @@ class InternVLModel(MegatronModule):
         self.all_gather = _AllGather()
         
         self.image_size = vision_transformer_config.image_size
+
+        self.VIT_DP_SIZE = mpu._VISION_DATA_PARALLEL_SIZE if mpu._VISION_DATA_PARALLEL_SIZE is not None else 1
+        self.VIT_DP_RANK = mpu._VISION_DATA_PARALLEL_RANK if mpu._VISION_DATA_PARALLEL_RANK is not None else 0
+        self.VIT_DP_GROUP = mpu._VISION_DATA_PARALLEL_GROUP if mpu._VISION_DATA_PARALLEL_GROUP is not None else None
+
+        self.LLM_TP_SIZE = mpu._LLM_TP_SIZE if mpu._LLM_TP_SIZE is not None else mpu.get_tensor_model_parallel_world_size()
+        self.LLM_TP_RANK = mpu._LLM_TP_RANK if mpu._LLM_TP_RANK is not None else mpu.get_tensor_model_parallel_rank()
         
     def set_input_tensor(self, input_tensor) -> None:
         # This is usually handled in schedules.py but some inference code still
@@ -173,11 +171,11 @@ class InternVLModel(MegatronModule):
 
         return vit_embeds
 
-    def preprocess_for_sp(self, pixel_values, image_flags):
-        sp_size = self.SP_SIZE
+    def preprocess_for_sp_dp(self, pixel_values, image_flags):
+        sp_size, vit_dp_size = self.SP_SIZE, self.VIT_DP_SIZE
         num_image = pixel_values.shape[0]
-        if num_image % sp_size != 0:
-            num_pad_image = sp_size - num_image % sp_size
+        if num_image % (sp_size * vit_dp_size) != 0:
+            num_pad_image = (sp_size * vit_dp_size) - num_image % (sp_size * vit_dp_size) # 计算需要填充的图像数量
             pad_images = torch.zeros(num_pad_image, 3, self.image_size, self.image_size, device=pixel_values.device, dtype=pixel_values.dtype)
             pad_images_flages = torch.tensor([0] * num_pad_image, dtype=torch.long).to(dtype=image_flags.dtype, device=image_flags.device)
             pixel_values = torch.cat([pixel_values, pad_images], dim=0)
@@ -189,6 +187,9 @@ class InternVLModel(MegatronModule):
         tensor_list = torch.split(tensor, size // self.SP_SIZE, dim=dim)
         return tensor_list[rank].contiguous()
 
+    def split_for_dp(self, tensor, size, dim, rank):
+        tensor_list = torch.split(tensor, size // self.VIT_DP_SIZE, dim=dim)
+        return tensor_list[rank].contiguous()
         
     def forward(
         self,
@@ -220,17 +221,24 @@ class InternVLModel(MegatronModule):
                     pixel_values = pixel_values[image_flags == 1]
                     image_flags = image_flags[image_flags == 1]
 
-                pixel_values, image_flags = self.preprocess_for_sp(pixel_values, image_flags)
+                pixel_values, image_flags = self.preprocess_for_sp_dp(pixel_values, image_flags)
                 pixel_values = self.split_for_sp(pixel_values, pixel_values.shape[0], 0, self.SP_RANK)
+                if self.VIT_DP_SIZE > 1:
+                    pixel_values = self.split_for_dp(pixel_values, pixel_values.shape[0], 0, self.VIT_DP_RANK)
 
                 pixel_values = pixel_values.to(device=input_embeds.device, dtype=input_embeds.dtype)
                 image_flags = image_flags.to(device=input_embeds.device)
                     
                 vit_batch_size = pixel_values.shape[0]
                 vit_embeds, _ = self.extract_feature(pixel_values)
+
+                if self.VIT_DP_SIZE > 1:
+                    vit_embeds = self.all_gather.apply(vit_embeds, 0, self.VIT_DP_SIZE,
+                                                       self.VIT_DP_GROUP, self.VIT_DP_RANK)
+
                 if len(image_flags) != pixel_values.shape[0] and self.SP_SIZE > 1:
                     vit_embeds = self.all_gather.apply(vit_embeds, 0, self.SP_SIZE,
-                                                       self.SP_GROUP, self.SP_RANK, image_flags)
+                                                       self.SP_GROUP, self.SP_RANK)
                 
                 vit_embeds = vit_embeds[image_flags == 1]
                 
@@ -256,8 +264,9 @@ class InternVLModel(MegatronModule):
                 
                 input_embeds = input_embeds.reshape(N, B, C)
                 
-            if self.config.sequence_parallel:
-                input_embeds = tensor_parallel.scatter_to_sequence_parallel_region(input_embeds)
+            if self.LLM_TP_SIZE > 1:
+                # input_embeds = tensor_parallel.scatter_to_sequence_parallel_region(input_embeds)
+                input_embeds = torch.split(input_embeds, input_embeds.shape[0] // self.LLM_TP_SIZE, dim=0)[self.LLM_TP_RANK]
                 input_embeds = input_embeds.contiguous()
         else:
             input_embeds = None
@@ -274,3 +283,25 @@ class InternVLModel(MegatronModule):
         )
 
         return output
+
+    def freeze(self, freeze_language_model: bool, freeze_vision_model: bool, freeze_mlp: bool):
+        """Freeze model modules.
+
+        Make specific modules non-trainable by setting requires_grad to False for the module's parameters.
+
+        Args:
+            freeze_language_model (bool): Freeze the language model module.
+            freeze_vision_model (bool): Freeze the vision model module.
+            freeze_mlp (bool): Freeze the vision projection module.
+        """
+        modules = []
+        if freeze_language_model and self.language_model is not None:
+            modules.append(self.language_model)
+        if freeze_vision_model and self.vision_model is not None:
+            modules.append(self.vision_model)
+        if freeze_mlp and self.mlp1 is not None:
+            modules.append(self.mlp1)
+
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False

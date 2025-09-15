@@ -18,7 +18,16 @@ from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.dataset.utils import dynamic_preprocess_v3, build_transform, preprocess_internlm_v3_mm_chat, IMG_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN
+from verl.utils.dataset.image_processors import pil_to_bytes
 
+def use_image_bytes(func):
+    def wrapper(self, row_dict):
+        output_dict = func(self, row_dict)
+        if self.config.get('use_image_bytes', False):
+            output_dict['multi_modal_data']['image'] = [pil_to_bytes(image) for image in output_dict['multi_modal_data']['image']]
+            output_dict['multi_modal_inputs'] = {}
+        return output_dict
+    return wrapper
 
 def process_image(image: dict, max_pixels: int = 1536 * 1536, min_pixels: int = 128 * 128, max_aspect_ratio: float = 100):
     import math
@@ -180,6 +189,8 @@ class RLHFJSONDataset(RLHFDataset):
 
         return messages
 
+
+    @use_image_bytes
     def _internvl_preprocess(self, row_dict):
         output_dict = {}
         output_dict['reward_model'] = row_dict['reward_model']

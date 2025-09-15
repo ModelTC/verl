@@ -14,6 +14,13 @@ from .vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from .model import InternVLModel
 from .vision_config import get_vision_model_config, get_mlp_config
 
+from mbridge.core.util import (
+    broadcast_from_megatron_pp,
+    broadcast_str_from_megatron_pp,
+    unwrap_model,
+)
+from megatron.core import parallel_state as mpu
+
 @register_model("internvl_chat")
 class InternVLBridge(VLMBridge):
     """
@@ -181,6 +188,11 @@ class InternVLBridge(VLMBridge):
                 img_context_token_id=hf_config.img_context_token_id,
             )
 
+            freeze_language_model = getattr(hf_config, "freeze_language_model", False)
+            freeze_vision_model = getattr(hf_config, "freeze_vision_model", False)
+            freeze_mlp = getattr(hf_config, "freeze_mlp", False)
+            model.freeze(freeze_language_model, freeze_vision_model, freeze_mlp)
+
             for callback in post_model_creation_callbacks:
                 callback(model)
 
@@ -271,6 +283,11 @@ class InternVLBridge(VLMBridge):
             NotImplementedError: If the parameter name is unsupported
         """
         hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
+
+        if 'vision_model' in mcore_weights_name:
+            if 'self_attention.linear_qkv.' in mcore_weights_name:
+                hf_names = hf_names * 3
+
         if len(hf_names) == 1:
             return [hf_names[0]], [mcore_weights]
         if ("self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name):
@@ -280,11 +297,13 @@ class InternVLBridge(VLMBridge):
             num_key_value_heads = getattr(self.hf_config.llm_config, "num_key_value_heads", 32)
             hidden_dim = getattr(self.hf_config.llm_config, "hidden_size", 4096)
             num_attention_heads = getattr(self.hf_config.llm_config, "num_attention_heads", 32)
-
-            if "vision_model" in mcore_weights_name:
-                num_attention_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
-                num_key_value_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
             head_dim = getattr(self.hf_config.llm_config, "head_dim", hidden_dim // num_attention_heads)
+            if "vision_model" in mcore_weights_name:
+                num_attention_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                num_key_value_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                hidden_dim = getattr(self.hf_config.vision_config, "hidden_size", 1536)
+                head_dim = getattr(self.hf_config.vision_config, "head_dim", hidden_dim // num_attention_heads) # 1536 / 16 = 96
+
             out_shape = ([num_key_value_heads, -1, hidden_dim] if ".bias" not in mcore_weights_name else [num_key_value_heads, -1])
             qkv = mcore_weights.view(*out_shape)
             q_len = head_dim * num_attention_heads // num_key_value_heads
@@ -294,7 +313,12 @@ class InternVLBridge(VLMBridge):
             q = qkv[:, :q_len].reshape(*single_out_shape)
             k = qkv[:, q_len:q_len + k_len].reshape(*single_out_shape)
             v = qkv[:, q_len + k_len:].reshape(*single_out_shape)
-            return hf_names, [q, k, v]
+
+            if 'vision_model' in mcore_weights_name:
+                qkv = torch.cat([q, k, v], dim=0)
+                return [hf_names[0]], [qkv]
+            else:
+                return hf_names, [q, k, v]
 
         elif ("linear_fc1.weight" in mcore_weights_name or "linear_fc1.bias" in mcore_weights_name):
             # split gate_proj and up_proj
@@ -320,6 +344,10 @@ class InternVLBridge(VLMBridge):
         Raises:
             NotImplementedError: If the parameter name is unsupported
         """
+        if 'vision_model' in mcore_weights_name:
+            if 'self_attention.linear_qkv.' in mcore_weights_name:
+                hf_weights = hf_weights[0].chunk(3)
+
         if len(hf_weights) == 1:
             return hf_weights[0]
         if ("self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name):
@@ -328,10 +356,13 @@ class InternVLBridge(VLMBridge):
             num_key_value_heads = getattr(self.hf_config.llm_config, "num_key_value_heads", 32)
             hidden_dim = getattr(self.hf_config.llm_config, "hidden_size", 4096)
             num_attention_heads = getattr(self.hf_config.llm_config, "num_attention_heads", 32)
-            if "vision_model" in mcore_weights_name:
-                num_attention_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
-                num_key_value_heads = getattr(self.hf_config, "vision_config", {}).get("num_heads", 16)
             head_dim = getattr(self.hf_config.llm_config, "head_dim", hidden_dim // num_attention_heads)
+            if "vision_model" in mcore_weights_name:
+                num_attention_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                num_key_value_heads = getattr(self.hf_config.vision_config, "num_attention_heads", 16)
+                hidden_dim = getattr(self.hf_config.vision_config, "hidden_size", 1536)
+                head_dim = getattr(self.hf_config.vision_config, "head_dim", hidden_dim // num_attention_heads)
+
             group_dim = head_dim * num_attention_heads // num_key_value_heads
             q, k, v = hf_weights
             # q k v might be tp split
@@ -399,6 +430,120 @@ class InternVLBridge(VLMBridge):
                     ret[k] = f"{name_prefix}.weight{global_expert_idx}"
 
         return ret
+
+
+    def _weight_merge_across_tp(
+        self,
+        mcore_weights_name: str,
+        mcore_weights: list[torch.Tensor],
+        param: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Merge weights across tensor parallel ranks.
+        In mcore format
+
+        Args:
+            mcore_weights_name: MCore weight name
+            mcore_weights: List of MCore weight tensors from different TP ranks
+            param: Parameter tensor
+
+        Returns:
+            torch.Tensor: Merged weight tensor
+        """
+        if self.mpu.tp_size == 1:
+            assert len(mcore_weights) == 1
+            return mcore_weights[0]
+        if "mlp.experts.linear_fc" in mcore_weights_name:
+            assert len(mcore_weights) == self.mpu.etp_size
+        else:
+            assert len(mcore_weights) == self.mpu.tp_size
+        if (
+            "self_attention.linear_qkv." in mcore_weights_name
+            and "layer_norm" not in mcore_weights_name
+        ):
+            return torch.cat(mcore_weights, dim=0)
+        elif (
+            "linear_fc1.weight" in mcore_weights_name
+            or "linear_fc1.bias" in mcore_weights_name
+        ):
+
+            if 'vision_model' in mcore_weights_name or 'mlp1' in mcore_weights_name:
+                ret = torch.cat(mcore_weights, dim=0)
+            else:
+                # if the tensor is gate and proj
+                gate_lst = []
+                up_lst = []
+                for mcore_weight in mcore_weights:
+                    gate, up = mcore_weight.chunk(2)
+                    gate_lst.append(gate)
+                    up_lst.append(up)
+                gate = torch.cat(gate_lst, dim=0)
+                up = torch.cat(up_lst, dim=0)
+                ret = torch.cat((gate, up), dim=0)
+
+        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
+            ret = torch.cat(mcore_weights, dim=1)
+        else:
+            assert (
+                hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
+            )
+            ret = torch.cat(mcore_weights, dim=param.partition_dim)
+
+        return ret
+
+    def _weight_split_across_tp(
+        self,
+        mcore_weights_name: str,
+        mcore_weights: torch.Tensor,
+        param: torch.Tensor,
+        tp_split_size: int,
+    ) -> list[torch.Tensor]:
+        """
+        Split weight tensor across tensor parallel ranks.
+
+        Args:
+            mcore_weights_name: MCore weight name
+            mcore_weights: MCore weight tensor
+            param: Parameter tensor
+
+        Returns:
+            list: List of weight tensors split for each TP rank
+        """
+        if tp_split_size == 1:
+            return [mcore_weights]
+
+        if (
+            "self_attention.linear_qkv." in mcore_weights_name
+            and "layer_norm" not in mcore_weights_name
+        ):
+            return mcore_weights.chunk(tp_split_size)
+        elif (
+            "linear_fc1.weight" in mcore_weights_name
+            or "linear_fc1.bias" in mcore_weights_name
+        ):
+
+            if 'vision_model' in mcore_weights_name or 'mlp1' in mcore_weights_name:
+                ret = mcore_weights.chunk(tp_split_size)
+            else:
+                gate, up = mcore_weights.chunk(2)
+                gates = gate.chunk(tp_split_size)
+                ups = up.chunk(tp_split_size)
+                ret = [torch.cat([g, u], dim=0) for g, u in zip(gates, ups)]
+        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
+            ret = mcore_weights.chunk(tp_split_size, dim=1)
+        else:
+            if param.shape == mcore_weights.shape:
+                return [mcore_weights for _ in range(tp_split_size)]
+            assert len(param.shape) == len(mcore_weights.shape)
+            for partition_dim, (s1, s2) in enumerate(
+                zip(param.shape, mcore_weights.shape)
+            ):
+                if s1 != s2:
+                    break
+
+            ret = mcore_weights.chunk(tp_split_size, dim=partition_dim)
+        return ret
+
 
     def _build_config(self):
         """
@@ -500,6 +645,7 @@ class InternVLBridge(VLMBridge):
             "use_cpu_initialization": False,
             "overlap_p2p_comm": overlap_p2p_comm,
             "batch_p2p_comm": batch_p2p_comm,
+            "qk_layernorm": getattr(hf_config, "qk_normalization", True),
         }
 
         # Update with any provided overrides
@@ -507,3 +653,168 @@ class InternVLBridge(VLMBridge):
         base_config.update(self.extra_args)
 
         return self.TransformerConfigClass(**base_config)
+
+    def export_weights(
+        self, models: list[torch.nn.Module]
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        models = [unwrap_model(model) for model in models]
+
+        def get_model_chunk_generator():
+            for model in models:
+                existing_keys = set()
+                for name, param in model.named_parameters():
+                    existing_keys.add(name)
+                    yield name, param
+
+                # note
+                # there is a bug in megatron GPTModel
+                # decoder.layers[n].mlp.router.expert_bias" in GPTModel is not registered in named_parameter, but in state_dict().
+                # for now we patch it by adding those keys to extra_keys.
+                extra_keys = [
+                    x
+                    for x in model.state_dict().keys()
+                    if "_extra_state" not in x
+                    and "expert_bias" in x
+                    and x not in existing_keys
+                ]
+                for name in extra_keys:
+                    yield name, model.state_dict()[name].to(torch.cuda.current_device())
+
+        weights_names = []
+        for vpp_rank, model in enumerate(models):
+            existing_keys = set()
+            for name, param in model.named_parameters():
+                existing_keys.add(name)
+                weights_names.append((self.mpu.pp_rank, vpp_rank, name))
+            extra_keys = [
+                x
+                for x in model.state_dict().keys()
+                if "_extra_state" not in x
+                and "expert_bias" in x
+                and x not in existing_keys
+            ]
+            for name in extra_keys:
+                weights_names.append((self.mpu.pp_rank, vpp_rank, name))
+
+        weights_names_all_pp = [None] * self.mpu.pp_size
+        torch.distributed.all_gather_object(
+            object_list=weights_names_all_pp, obj=weights_names, group=self.mpu.pp_group
+        )
+        weights_names_all_pp = sum(weights_names_all_pp, [])
+        model_chunk_generator = get_model_chunk_generator()
+        local_to_global_maps = [
+            self._weight_name_mapping_mcore_local_to_global(model, consider_ep=False)
+            for model in models
+        ]
+        for iter_pp_rank, iter_vpp_rank, iter_name in weights_names_all_pp:
+            local_to_global_map = local_to_global_maps[iter_vpp_rank]
+            if iter_pp_rank == self.mpu.pp_rank:
+                try:
+                    name, param = next(model_chunk_generator)
+                except StopIteration:
+                    name, param = None, None
+                name = local_to_global_map[iter_name]
+            else:
+                name, param = None, None
+
+            name = broadcast_str_from_megatron_pp(name)
+            broad_pp_param = broadcast_from_megatron_pp(param)
+
+            # EP
+            if ".mlp.experts.linear_fc" in name and self.mpu.ep_size > 1:
+                num_experts = self.config.num_moe_experts
+                num_experts_per_rank = num_experts // self.mpu.ep_size
+                infer_params = [
+                    torch.empty_like(broad_pp_param) for _ in range(self.mpu.ep_size)
+                ]
+                torch.distributed.all_gather(
+                    infer_params, broad_pp_param, group=self.mpu.ep_group
+                )
+
+                name_prefix, local_expert_id = name.split(".weight")
+                local_expert_id = int(local_expert_id)
+                global_expert_ids = [
+                    num_experts_per_rank * ep_rank + local_expert_id
+                    for ep_rank in range(self.mpu.ep_size)
+                ]
+                global_expert_names = [
+                    f"{name_prefix}.weight{expert_id}"
+                    for expert_id in global_expert_ids
+                ]
+
+                for name, param in zip(global_expert_names, infer_params):
+                    if self.mpu.etp_size > 1:
+                        # gather etp
+                        etp_params = [
+                            torch.empty_like(param) for _ in range(self.mpu.etp_size)
+                        ]
+                        torch.distributed.all_gather(
+                            etp_params, param, group=self.mpu.etp_group
+                        )
+                        params = etp_params
+                    else:
+                        params = [param]
+
+                    merge_params = self._weight_merge_across_tp(
+                        name, params, broad_pp_param
+                    )
+                    converted_names, converted_params = self._weight_to_hf_format(
+                        name, merge_params
+                    )
+                    yield from zip(converted_names, converted_params)
+                continue
+
+            # TP
+            if (
+                hasattr(broad_pp_param, "tensor_model_parallel")
+                and broad_pp_param.tensor_model_parallel
+            ):
+                if mpu._VISION_TP_SIZE != mpu._LLM_TP_SIZE:
+                    if self.mpu.pp_rank == 0:
+                        self.mpu.tp_group = mpu._LLM_TP_GROUP
+                        self.mpu.tp_size = mpu._LLM_TP_SIZE
+                    
+                    if name.startswith("vision_model") or name.startswith("mlp1") or "word_embeddings" in name:
+                        infer_params = broad_pp_param
+                    else:
+                        # allocate a new tensor with proper size
+                        if self.mpu.tp_size <= 1:
+                            infer_params = [broad_pp_param]
+                        else:
+                            infer_params = [
+                                torch.empty_like(broad_pp_param)
+                                for _ in range(self.mpu.tp_size)
+                            ]
+                            torch.distributed.all_gather(
+                                infer_params, broad_pp_param, group=self.mpu.tp_group
+                            )
+                        infer_params = self._weight_merge_across_tp(
+                            name, infer_params, broad_pp_param
+                        )
+                else:
+                    # allocate a new tensor with proper size
+                    if self.mpu.tp_size <= 1:
+                        infer_params = [broad_pp_param]
+                    else:
+                        infer_params = [
+                            torch.empty_like(broad_pp_param)
+                            for _ in range(self.mpu.tp_size)
+                        ]
+                        torch.distributed.all_gather(
+                            infer_params, broad_pp_param, group=self.mpu.tp_group
+                        )
+
+                    infer_params = self._weight_merge_across_tp(
+                        name, infer_params, broad_pp_param
+                    )
+            else:
+                infer_params = broad_pp_param
+
+            converted_names, converted_params = self._weight_to_hf_format(
+                name, infer_params
+            )
+
+            yield from zip(converted_names, converted_params)
+
+        self.mpu.tp_group = mpu.get_tensor_model_parallel_group()
+        self.mpu.tp_size = mpu.get_tensor_model_parallel_world_size()

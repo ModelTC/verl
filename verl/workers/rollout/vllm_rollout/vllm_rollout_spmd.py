@@ -35,6 +35,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from types import MethodType
 from typing import Any
+from PIL import Image
 
 import numpy as np
 import ray
@@ -51,9 +52,11 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
+from verl.utils.dataset.image_processors import bytes_to_pil
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -273,10 +276,27 @@ class vLLMRollout(BaseRollout):
 
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(
-                non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), strict=True
-            ):
+
+            drop_multi_modal_data = True
+            def image_convert(image_item):
+                if isinstance(image_item, Image.Image):
+                    return image_item
+                elif isinstance(image_item, bytes):
+                    drop_multi_modal_data = False
+                    return bytes_to_pil(image_item)
+                else:
+                    raise ValueError(f"Unsupported image type: {type(image_item)}")
+
+            image_list = []
+            for multi_modal_data in non_tensor_batch["multi_modal_data"]:
+                image = multi_modal_data['image']
+                image_list.append({"image": [image_convert(image_item) for image_item in image]})
+
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), image_list, strict=True):
                 vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+
+            if drop_multi_modal_data:
+                non_tensor_batch.pop("multi_modal_data")
         else:
             vllm_inputs = [
                 {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")

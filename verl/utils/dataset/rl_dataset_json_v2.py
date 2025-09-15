@@ -4,6 +4,7 @@ import json
 from transformers import PreTrainedTokenizer, ProcessorMixin
 import torch
 import random
+random.seed(42)
 from PIL import UnidentifiedImageError
 
 import copy
@@ -18,7 +19,16 @@ from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.dataset.utils import dynamic_preprocess_v4, build_transform, IMG_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN
+from verl.utils.dataset.image_processors import pil_to_bytes
 
+def use_image_bytes(func):
+    def wrapper(self, row_dict):
+        output_dict = func(self, row_dict)
+        if self.config.get('use_image_bytes', False):
+            output_dict['multi_modal_data']['image'] = [pil_to_bytes(image) for image in output_dict['multi_modal_data']['image']]
+            output_dict['multi_modal_inputs'] = {}
+        return output_dict
+    return wrapper
 
 def process_image(image: dict, max_pixels: int = 1536 * 1536, min_pixels: int = 128 * 128, max_aspect_ratio: float = 100):
     import math
@@ -162,8 +172,8 @@ def format_prompt_agentic_legacy(
 
 format_prompt_fns = {
     'general': format_prompt_general,
-    # 'agentic': format_prompt_agentic,
-    'agentic': format_prompt_agentic_legacy
+    'agentic': format_prompt_agentic,
+    # 'agentic': format_prompt_agentic_legacy
 }
 
 
@@ -254,7 +264,6 @@ class RLHFJSONDataset(RLHFDataset):
         """
         row_dict: dict = copy.deepcopy(self.dataframe[item])
         preprocess_fn = self._internvl_preprocess if self.apply_internvl_preprocess else self._default_preprocess
-
         try:
             return preprocess_fn(row_dict)
         except Exception as e:
@@ -271,14 +280,14 @@ class RLHFJSONDataset(RLHFDataset):
                 elif segment == "<image>":
                     image = images.pop(0)
                     img_byte_arr = io.BytesIO()
-                    image.save(img_byte_arr, format='JPEG')
+                    image.save(img_byte_arr, format='PNG')
                     img_byte_arr = img_byte_arr.getvalue()
                     img_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
                     
                     content_list.append({
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_base64}"
+                            "url": f"data:image/png;base64,{img_base64}"
                         },
                     })
                 else:
@@ -290,6 +299,8 @@ class RLHFJSONDataset(RLHFDataset):
 
         return messages
 
+
+    @use_image_bytes
     def _internvl_preprocess(self, row_dict):
         output_dict = {}
         output_dict['reward_model'] = row_dict['reward_model']

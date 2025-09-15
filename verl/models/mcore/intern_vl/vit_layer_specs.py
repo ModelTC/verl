@@ -764,7 +764,7 @@ def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
         submodules=TransformerLayerSubmodules(
             input_layernorm=TENorm,
             self_attention=ModuleSpec(
-                module=InternBaseSelfAttention, # SelfAttention,
+                module=SelfAttention, # InternBaseSelfAttention,
                 params={"attn_mask_type": AttnMaskType.no_mask},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TEColumnParallelLinear, # TELayerNormColumnParallelLinear,

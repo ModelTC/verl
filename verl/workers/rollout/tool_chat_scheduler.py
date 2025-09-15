@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import json
+import time
 from typing import Any, Dict, List
 import random
 import json
@@ -32,6 +33,7 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.models.transformers.qwen2_vl import get_rope_index
+from verl.utils.profiler.performance import simple_timer
 
 import io
 import base64
@@ -39,24 +41,12 @@ import numpy as np
 from PIL import Image
 from sandbox_fusion import run_jupyter_async, RunJupyterRequest
 
-from verl.utils.dataset.image_processors import adaptive_resize_image, preprocess_images_internvl, preprocess_images_qwenvl
+from verl.utils.dataset.image_processors import adaptive_resize_image, preprocess_images_internvl, preprocess_images_qwenvl, pil_to_bytes
+from verl.utils.dataset.image_processors import base64_to_pil, pil_to_base64
+
 
 def repeat_each(lst, n):
     return [x for x in lst for _ in range(n)]
-
-
-def base64_to_pil(image_base64):
-    image_data = base64.b64decode(image_base64)
-    image_io = io.BytesIO(image_data)
-    image = Image.open(image_io)
-    return image
-
-
-def pil_to_base64(image):
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")  # You can change the format if needed, e.g., "JPEG"
-    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return image_base64
 
 
 class ToolChatCompletionScheduler(ChatCompletionScheduler):
@@ -66,39 +56,57 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
     """
     def __init__(self, config, model_path, server_addresses, sandbox_address, data_config, max_turns=10, **kwargs):
         super().__init__(config, model_path, server_addresses, **kwargs)
+        self.data_config = data_config
         self.sandbox_address = sandbox_address
         self.max_turns = max_turns
         self.max_prompt_length = data_config.max_prompt_length
         self.max_response_length = data_config.max_response_length
 
+        self._chat_template_prefix_suffix = {
+            "user": {
+                "prefix_ids": list(self.tokenizer.encode("<|im_start|>user\n")),
+                "suffix_ids": list(self.tokenizer.encode("<|im_end|>\n")),
+                "suffix_ids_wo_eos": list(self.tokenizer.encode("\n")),
+            },
+            "assistant": {
+                "prefix_ids": list(self.tokenizer.encode("<|im_start|>assistant\n")),
+                "suffix_ids": list(self.tokenizer.encode("<|im_end|>\n")),
+                "suffix_ids_wo_eos": list(self.tokenizer.encode("\n")),
+            }
+        }
+
         if type(self) is ToolChatCompletionScheduler:
             raise TypeError("ToolChatCompletionScheduler is an abstract class and should not be instantiated directly.")
 
-    def message_to_token(self, message):
+    def _message_to_token(self, message):
         if isinstance(message['content'], str):
             token_ids = self.tokenizer.apply_chat_template(
                 [message], add_generation_prompt=False, tokenize=True
             )
+            token_ids_for_gen = token_ids
 
         elif isinstance(message['content'], list):
-            images = []
+            image_wh = []
             text = ''
             for part in message['content']:
                 assert isinstance(part, dict), f'part: {part}'
                 if part['type'] == "image_url":
-                    image_base64 = part['image_url']['url'].split("base64,")[1]
-                    image = base64_to_pil(image_base64)
-                    images.append(image)
+                    wh = (part['image_url']['w'], part['image_url']['h'])
+                    image_wh.append(wh)
                 elif part['type'] == "text":
                     text += part['text']
 
-            text = self._add_image_tokens_to_text(text, images)
+            token_ids_for_gen = self.tokenizer.apply_chat_template(
+                [{'role': message['role'], 'content': text}], add_generation_prompt=False, tokenize=True
+            )
+
+            text = self._add_image_tokens_to_text(text, image_wh, image_wh=image_wh)
             new_message = {'role': message['role'], 'content': text}
             token_ids = self.tokenizer.apply_chat_template(
                 [new_message], add_generation_prompt=False, tokenize=True
             )
 
-        return token_ids
+        return token_ids, token_ids_for_gen
 
     async def sandbox_run_jupyter(self, cells: list, max_attempts: int=3, timeout: int=300):
         """Execute python code in sandbox."""
@@ -116,9 +124,14 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 max_attempts=max_attempts,
                 client_timeout=timeout+30,
             )
-            return resp.cells[-1]
         except Exception as e:
             print(f"sandbox exception: {e}, {type(e)=}")
+            return
+
+        if resp.cells:
+            return resp.cells[-1]
+        else:
+            print("[ToolChatCompletionScheduler] Warning: no cells in response")
             return
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -128,6 +141,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             max_completion_tokens=self.config.response_length,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
+            logprobs=True,
         )
 
         do_sample = batch.meta_info.get("do_sample", True)
@@ -160,7 +174,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         print(f"[ToolChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
 
         # 2. helper functions
-        async def _process_response(cells, resp):
+        async def _process_tool_call(cells, resp):
             # === 1. 提取并验证工具调用 ===
             
             # 1.1 必须且只能找到一个 tool_call 块
@@ -183,6 +197,9 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
 
             # 1.4 目前只支持 'python' 工具
             if tool_call.get('name') != 'python':
+                return
+
+            if not isinstance(tool_call.get('arguments'), dict):
                 return
 
             code = tool_call.get('arguments', {}).get('code')
@@ -212,19 +229,33 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                     try:
                         if "image/png" in item:
                             # 图像处理逻辑
-                            image = base64_to_pil(item['image/png'])
-                            image = self._process_image(image)
-                            image_base64 = pil_to_base64(image)
+                            process = False
+                            if hasattr(self, "_need_process"):
+                                wh = Image.open(io.BytesIO(base64.b64decode(item['image/png']))).size
+                                if self._need_process(wh[0], wh[1]):
+                                    process = True
+                            else:
+                                process = True
+                            if process:
+                                image = base64_to_pil(item['image/png'])
+                                image = self._process_image(image)
+                                image_base64 = pil_to_base64(image)
+                                wh = Image.open(io.BytesIO(base64.b64decode(image_base64))).size
+                            else:
+                                image_base64 = item['image/png']
                             
                             images.append({
                                 "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                                "image_url": {"url": f"data:image/png;base64,{image_base64}",
+                                              "w": wh[0],
+                                              "h": wh[1]}
                             })
                             texts.append(self.image_tag)
                         if 'text/plain' in item:
                             texts.append(item['text/plain'])
                     except Exception as e:
                         # 如果单个 display item 处理失败，跳过它，而不是中断整个流程
+                        print(e)
                         continue
                 
                 # 将收集到的文本和图片组装成最终的 content 格式
@@ -245,11 +276,11 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                     content = [{"type": "text", "text": clean_trace}]
                 except (TypeError, AttributeError):
                     # 如果错误格式不规范，返回一个通用错误信息
-                    content = [{"type": "text", "text": "[An unknown error occurred during execution.]"}]
+                    content = [{"type": "text", "text": "<tool_response>\n[An unknown error occurred during execution.]\n</tool_response>"}]
             
             # 情况三：执行成功，但没有任何输出
             else:
-                content = [{"type": "text", "text": "[Execution completed with no output.]"}]
+                content = [{"type": "text", "text": "<tool_response>\n[Execution completed with no output.]\n</tool_response>"}]
 
             # === 4. 返回最终消息 ===
             if not content:
@@ -261,39 +292,53 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
             assert exception is None, f"exception: {exception}, {type(exception)=} {info['response_length']=}, {self.max_response_length=} {info['turn']=}"
 
-            batch_conversations, batch_index, cells, turn, response_length = (
+            batch_conversations, batch_index, cells, turn, response_length, metrics = (
                 info["batch_conversations"],
                 info["batch_index"],
                 info["cells"],
                 info["turn"],
-                info["response_length"]
+                info["response_length"],
+                info["metrics"]
             )
 
+            # process the response from completions
             assert len(completions.choices) == 1
             choice = completions.choices[0]
             role, content = choice.message.role, choice.message.content
-            content = self._update_content(role, content)
-            message = {"role": role, "content": content}
-            message['token_ids'] = self.message_to_token(message)
+            token_ids, logprobs = zip(*map(lambda x: (int(x.token[9:]), x.logprob), choice.logprobs.content))
+            response_mask = [1] * len(token_ids)
+            message = {
+                "role": role,
+                "content": content,
+                "token_ids": list(token_ids),
+                "logprobs": list(logprobs),
+                "response_mask": response_mask,
+            }
+            message = self._update_message(message)
+
             batch_conversations[batch_index].append(message)
-            response_length += len(message['token_ids'])
+            response_length += len(message['token_ids_for_train'])
 
             if turn == self.max_turns or response_length > self.max_response_length:
+                metrics['end_time'] = time.time()
                 return
 
-            tool_message = await _process_response(cells, content)
+            # check if the response contains a tool call
+            with simple_timer('tool_call', metrics):
+                tool_message = await _process_tool_call(cells, content)
             if tool_message == None:
+                metrics['end_time'] = time.time()
                 return
 
-            tool_token_ids = self.message_to_token(tool_message)
-            if response_length + len(tool_token_ids) > self.max_response_length:
+            tool_message = self._update_message(tool_message)
+            if response_length + len(tool_message['token_ids_for_train']) > self.max_response_length:
+                metrics['end_time'] = time.time()
                 return
 
-            response_length += len(tool_token_ids)
-            tool_message['token_ids'] = tool_token_ids
+            response_length += len(tool_message['token_ids_for_train'])
             batch_conversations[batch_index].append(tool_message)
 
-            # STEP 4: resubmit chat completions with code block output
+            # resubmit chat completions with code block output
             extra_headers = {"x-request-id": completions.id}
             await self.submit_chat_completions(
                 callback=callback,
@@ -302,10 +347,11 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                     "batch_index": batch_index,
                     "cells": cells,
                     "turn": turn + 1,
-                    "response_length": response_length
+                    "response_length": response_length,
+                    "metrics": metrics
                 },
                 model=self.model_name,
-                messages=batch_conversations[batch_index],
+                messages=batch_conversations[batch_index] + [{"role": "assistant", "token_ids": self._chat_template_prefix_suffix['assistant']['prefix_ids']}],
                 extra_headers=extra_headers,
                 **kwargs,
             )
@@ -314,13 +360,15 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         # TODO: we may need to control max concurrent requests here, or it will harm prefix cache hit rate.
         tasks, batch_conversations = [], [None] * len(batch)
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
+        batch_metrics = [{}] * len(batch)
 
         # For aiohttp
         kwargs['skip_special_tokens'] = False
 
         for batch_index, conversation in enumerate(raw_prompts):
-            conversation = conversation.tolist()
+            conversation = [self._update_message(msg) for msg in conversation.tolist()]
             batch_conversations[batch_index] = conversation
+            batch_metrics[batch_index] = {'start_time': time.time()}
             tasks.append(
                 asyncio.create_task(
                     self.submit_chat_completions(
@@ -331,9 +379,10 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                             "cells": [],
                             "turn": 1,
                             "response_length": 0,
+                            "metrics": batch_metrics[batch_index]
                         },
                         model=self.model_name,
-                        messages=conversation,
+                        messages=conversation + [{"role": "assistant", "token_ids": self._chat_template_prefix_suffix['assistant']['prefix_ids']}],
                         **kwargs,
                     )
                 )
@@ -341,46 +390,58 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         await asyncio.gather(*tasks)
         print(f"[{self.__class__.__name__}] generate_sequences done")
 
-        return self._postprocess(batch, batch_conversations)
+        post_start = time.time()
+        output = self._postprocess(batch, batch_conversations)
+        post_time = time.time() - post_start
+
+        metrics_list = []
+        for index, metrics in enumerate(batch_metrics):
+            metrics['generate_sequences'] = metrics['end_time'] - metrics['start_time'] + post_time
+            metrics['postprocess'] = post_time
+            metrics.pop('start_time')
+            metrics.pop('end_time')
+            metrics_list.append(metrics)
+        output.non_tensor_batch['metrics'] = np.array(metrics_list, dtype=object)
+
+        return output
 
     def _postprocess(self, batch: DataProto, batch_conversations) -> DataProto:
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
 
-        batch_resp_ids, batch_loss_mask = [], []
+        batch_resp_ids, batch_loss_mask, batch_logps = [], [], []
         multi_modal_inputs = []
+        multi_modal_data = []
         for prompt, convs in zip(raw_prompts, batch_conversations):
             resp_convs = convs[len(prompt):]
-            resp_ids, loss_mask = [], []
+            resp_ids, loss_mask, logprobs = [], [], []
             whole_images = []
 
             for message in resp_convs:
-                length = len(message['token_ids'])
-                resp_ids.extend(message['token_ids'])
-                if message['role'] == 'assistant':
-                    loss_mask.extend([1] * length)
-                else:
-                    loss_mask.extend([0] * length)
+                resp_ids.extend(message['token_ids_for_train'])
+                loss_mask.extend(message['response_mask'])
+                logprobs.extend(message['logprobs'])
 
                 if isinstance(message['content'], list):
                     for part in message['content']:
                         if 'image_url' in part:
-                            image_base64 = part['image_url']['url'].split("base64,")[1]
-                            image = base64_to_pil(image_base64)
+                            image = part['image_url']['url'].split("base64,")[1]
+                            if not self.data_config.get('use_image_bytes', False):
+                                image = base64_to_pil(image)
                             whole_images.append(image)
 
             batch_resp_ids.append(resp_ids)
             batch_loss_mask.append(loss_mask)
+            batch_logps.append(logprobs)
 
-            image_inputs = self._build_multi_modal_input(whole_images)
-            multi_modal_inputs.append(image_inputs)
-        
-
+            if self.data_config.get('use_image_bytes', False):
+                multi_modal_data.append({"image": whole_images})
+            else:
+                image_inputs = self._build_multi_modal_input(whole_images)
+                multi_modal_inputs.append(image_inputs)
         # prompts: [prompt] from input dataset
         prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
         prompts = self.tokenizer(prompts, return_tensors="pt", padding="max_length", max_length=self.max_prompt_length, padding_side="left")
 
-        # flatten batch_conversations if n > 1
-        # batch_conversations = [conversation for conversations in batch_conversations for conversation in conversations]
         assert len(batch_conversations) == len(prompts["input_ids"])
         assert all(conversation[-1]['role'] == 'assistant' for conversation in batch_conversations)
 
@@ -398,6 +459,8 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
 
         batch_loss_mask = pad_2d_list_to_length(batch_loss_mask, 0, self.max_response_length)
         batch_loss_mask = batch_loss_mask[:, :self.max_response_length]
+        batch_logps = pad_2d_list_to_length(batch_logps, 0.0, self.max_response_length)
+        batch_logps = batch_logps[:, :self.max_response_length]
 
         batch = TensorDict(
             {
@@ -407,22 +470,29 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
                 "response_mask": batch_loss_mask,
+                "rollout_log_probs": batch_logps,
             },
             batch_size=len(input_ids),
         )
 
+        if self.data_config.get('use_image_bytes', False):
+            multi_modal_inputs = [{}] * len(batch)
+        else:
+            multi_modal_data = [{}] * len(batch)
+
         non_tensor_batch = {
-            "multi_modal_inputs": np.array(multi_modal_inputs, dtype=object)
+            "multi_modal_inputs": np.array(multi_modal_inputs, dtype=object),
+            "multi_modal_data": np.array(multi_modal_data, dtype=object)
         }
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
     
 
-    def _add_image_tokens_to_text(self, text, images):
+    def _add_image_tokens_to_text(self, text, images=None, image_wh=None):
         """
         Add image tokens to the text based on the number of images.
         """
-        _, text = self.preprocess_images_fn(images=images, text=text)
+        _, text = self.preprocess_images_fn(images=images, text=text, image_wh=image_wh)
         return text
     
     def _build_multi_modal_input(self, images):
@@ -435,13 +505,36 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
     def _process_image(self, image):
         return image
     
-    def _update_content(self, role, content):
-        return content
+    def _update_message(self, message):
+        role = message['role']
+
+        if role in ('user', 'system'):
+            token_ids_for_train, token_ids_for_gen = self._message_to_token(message)
+            message['token_ids'] = token_ids_for_gen
+            message['token_ids_for_train'] = token_ids_for_train
+            message['logprobs'] = [0.0] * len(token_ids_for_train)
+            message['response_mask'] = [0] * len(token_ids_for_train)
+
+        elif role == 'assistant':
+            # get chat template
+            prefix_ids = self._chat_template_prefix_suffix[role]['prefix_ids']
+            suffix_ids = self._chat_template_prefix_suffix[role]['suffix_ids_wo_eos'] if message['token_ids'][-1] == self.tokenizer.eos_token_id else self._chat_template_prefix_suffix[role]['suffix_ids']
+
+            # apply chat template
+            message['token_ids'] = prefix_ids + message['token_ids'] + suffix_ids
+            message['token_ids_for_train'] = message['token_ids']
+            message['logprobs'] = [0.0] * len(prefix_ids) + message['logprobs'] + [0.0] * len(suffix_ids)
+            message['response_mask'] = [0] * len(prefix_ids) + message['response_mask'] + [0] * len(suffix_ids)
+
+        else:
+            raise ValueError(f"Unknown role: {role}")
+
+        return message
 
 
 class ToolChatCompletionScheduler_InternVL(ToolChatCompletionScheduler):
 
-    image_tag = "<image>"
+    image_tag = "<img></img>"
 
     def __init__(self, config, model_path, server_addresses, sandbox_address, data_config, max_turns=10, **kwargs):
         super().__init__(config, model_path, server_addresses, sandbox_address, data_config, max_turns, **kwargs)
@@ -463,7 +556,7 @@ class ToolChatCompletionScheduler_InternVL(ToolChatCompletionScheduler):
             use_thumbnail=internvl_config['use_thumbnail'], 
             num_image_token=int((image_size // patch_size)**2 * (downsample_ratio**2))
         )
-
+        
     def _get_position_ids(self, input_ids, attention_mask, multi_modal_inputs):
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
         return position_ids
@@ -471,6 +564,12 @@ class ToolChatCompletionScheduler_InternVL(ToolChatCompletionScheduler):
     def _process_image(self, image):
         image = adaptive_resize_image(image, max_aspect_ratio=200)
         return image
+    
+    def _need_process(self, w, h, max_aspect_ratio=200):
+        longer, shorter = max(w, h), min(w, h)
+        if longer / shorter > max_aspect_ratio:
+            return True
+        return False
 
 class ToolChatCompletionScheduler_QwenVL(ToolChatCompletionScheduler):
     """
@@ -496,10 +595,18 @@ class ToolChatCompletionScheduler_QwenVL(ToolChatCompletionScheduler):
             short_side=28)
         return image
     
-    def _update_content(self, role, content):
+    def _update_message(self, role, message):
+        role = message['role']
         if role == 'assistant':
-            content = "<think>\n" + content
-        return content
+            extra_prefix = '<think>\n'
+            extra_prefix_ids = self.tokenizer.encode(extra_prefix)
+
+            message['content'] = extra_prefix + message['content']
+            message['token_ids'] = extra_prefix_ids + message['token_ids']
+            message['response_mask'] = [0] * len(extra_prefix_ids) + message['response_mask']
+            message['logprobs'] = [0.0] * len(extra_prefix_ids) + message['logprobs']
+        message = super()._update_message(message)
+        return message
 
     def _get_position_ids(self, input_ids, attention_mask, multi_modal_inputs):
         position_ids = torch.stack([get_rope_index(

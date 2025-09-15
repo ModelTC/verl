@@ -16,10 +16,12 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
+from functools import partial
 import logging
 import os
 import time
 from typing import Any
+import time
 
 import psutil
 import torch
@@ -57,6 +59,7 @@ from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.config import McoreCriticConfig
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
+from verl.workers.vision_tp_utils import init_vision_tp 
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -118,6 +121,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 nccl_communicator_config_path=None,
             )
 
+            from verl.utils.megatron_utils import print_node_to_rank_mapping
+            print_node_to_rank_mapping()
+
+            if self.config.actor.megatron.get("vision_tensor_model_parallel_size", None):
+                assert self.config.actor.megatron.vision_tensor_model_parallel_size == 1, \
+                    "vision_tensor_model_parallel_size must be 1 for separate vision tp"
+                assert self.config.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage == 0, \
+                    "num_layers_in_first_pipeline_stage must be 0 for separate vision tp"
+                init_vision_tp(self.config)
+
         set_random_seed(seed=self.config.actor.megatron.seed)
 
         self.role = role
@@ -159,6 +172,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "`log_prob_micro_batch_size` should not be None at the same time."
                 )
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
+
 
     def _build_model_optimizer(self, model_path, optim_config, override_model_config, override_transformer_config):
         from verl.utils.megatron.optimizer import get_megatron_optimizer, get_megatron_optimizer_param_scheduler
@@ -498,24 +512,30 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         get_torch_device().empty_cache()
         log_gpu_memory_usage("After init_model finish", logger=logger)
 
+
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red")
     def update_actor(self, data: DataProto):
+        metrics = {}
         assert self._is_actor
-        if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor_module)
-            log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            load_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        with Timer(name="load_model", logger=None) as timer:
+            if self._is_offload_param:
+                load_megatron_model_to_gpu(self.actor_module)
+                log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                load_megatron_optimizer(self.actor_optimizer)
+                log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        metrics["timing_s/load_model"] = timer.last
+
         data.batch = data.batch.to(get_device_name())
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         dataloader = self.actor.make_minibatch_iterator(data=data)
         with Timer(name="update_policy", logger=None) as timer:
-            metrics = self.actor.update_policy(dataloader=dataloader)
+            metrics.update(self.actor.update_policy(dataloader=dataloader))
+        metrics["timing_s/update_policy"] = timer.last
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
         estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -528,18 +548,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
         self.actor_optimizer_scheduler.step(1)
 
+        with Timer(name="offload_model", logger=None) as timer:
+            if self._is_offload_param:
+                offload_megatron_model_to_cpu(self.actor_module)
+                log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                offload_megatron_optimizer(self.actor_optimizer)
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        metrics["timing_s/offload_model"] = timer.last
+
+        aggressive_empty_cache(force_sync=True)
+
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
-
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-
-        aggressive_empty_cache(force_sync=True)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -626,6 +648,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
             log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
+
         aggressive_empty_cache(force_sync=True)
         return output
 

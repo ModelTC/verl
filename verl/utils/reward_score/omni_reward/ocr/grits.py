@@ -3,6 +3,7 @@ import numpy as np
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
 from verl.utils.reward_score.utils import ErrCode
+from func_timeout import func_set_timeout, FunctionTimedOut
 
 INCORRECT_SCORE = 0.
 CORRECT_SCORE = 1.
@@ -383,7 +384,7 @@ def iou(bbox1, bbox2):
     
     return 0
 
-
+@func_set_timeout(30)
 def calculate_grits(pred, gt):
     """
     Calculate GRITS (Grid Table Similarity) metrics for table structure and content.
@@ -441,15 +442,21 @@ def calculate_grits_reward(pred, gt, is_val=False, **kwargs):
         if pred.count('<table') != 1 or gt.count('</table') != 1:
             return {"score": 0, "grits_top": 0, "grits_con": 0}
         pred = '<table' + pred.split('<table', 1)[1].split('</table', 1)[0] + '</table>'
+    try:
+        grits_top, grits_con = calculate_grits(pred, gt)
+        if min(grits_top, grits_con) == 0:
+            score = 0
+        else:
+            score = 2 * grits_top * grits_con / (grits_top + grits_con)
 
-    grits_top, grits_con = calculate_grits(pred, gt)
-    if min(grits_top, grits_con) == 0:
-        score = 0
-    else:
-        score = 2 * grits_top * grits_con / (grits_top + grits_con)
-
-    return {
-        "score": score,
-        "grits_top": grits_top,
-        "grits_con": grits_con,
-    }
+        return {
+            "score": score,
+            "grits_top": grits_top,
+            "grits_con": grits_con,
+        }
+    
+    except FunctionTimedOut:
+        print("A task timed out!")
+        print(pred)
+        print(f'ground_truth:{gt}')
+        return {"score": INCORRECT_SCORE, "error_code": ErrCode.WRONG_ANSWER}
