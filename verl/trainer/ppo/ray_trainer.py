@@ -389,8 +389,12 @@ class RayPPOTrainer:
         if self.scheduler_kwargs.pop('use_data_config', False):
             self.scheduler_kwargs['data_config'] = self.config.data
 
-        self.on_policy = self.config.actor_rollout_ref.actor.ppo_epochs == 1 and self.config.actor_rollout_ref.actor.ppo_mini_batch_size == self.config.data.train_batch_size
-
+        self.on_policy = (
+            self.config.actor_rollout_ref.actor.ppo_epochs == 1 
+            and self.config.actor_rollout_ref.actor.ppo_mini_batch_size == self.config.data.train_batch_size
+            and self.config.actor_rollout_ref.actor.strategy == "megatron"
+        )
+        
     def _validate_config(self):
         config = self.config
         # number of GPUs total
