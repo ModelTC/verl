@@ -391,6 +391,9 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if self.config.tis_imp_ratio_cap > 0:
+            assert "rollout_log_probs" in data.batch.keys()
+            select_keys.append("rollout_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
 
@@ -425,6 +428,7 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = (
@@ -458,6 +462,8 @@ class DataParallelPPOActor(BasePPOActor):
                             cliprange_high=clip_ratio_high,
                             clip_ratio_c=clip_ratio_c,
                             loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
                         )
 
                     else:
