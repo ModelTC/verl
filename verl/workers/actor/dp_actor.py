@@ -452,7 +452,7 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                     if self.config.policy_loss.loss_mode == "vanilla":
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        ret = compute_policy_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
@@ -465,6 +465,10 @@ class DataParallelPPOActor(BasePPOActor):
                             config=self.config,
                             rollout_log_probs=rollout_log_probs,
                         )
+                        if self.config.tis_imp_ratio_cap > 0:
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean = ret
+                        else:
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = ret
 
                     else:
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
@@ -508,6 +512,8 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
 
+                    if self.config.tis_imp_ratio_cap > 0:
+                        micro_batch_metrics["actor/tis_imp_ratio_mean"] = tis_imp_ratio_mean.detach().item()
                     micro_batch_metrics.update(
                         {
                             "actor/pg_loss": pg_loss.detach().item(),
