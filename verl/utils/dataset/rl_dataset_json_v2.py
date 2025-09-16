@@ -20,6 +20,7 @@ import verl.utils.torch_functional as verl_F
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.dataset.utils import dynamic_preprocess_v4, build_transform, IMG_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN
 from verl.utils.dataset.image_processors import pil_to_bytes
+import datasets
 
 def use_image_bytes(func):
     def wrapper(self, row_dict):
@@ -223,6 +224,8 @@ class RLHFJSONDataset(RLHFDataset):
             raise Exception(f"filename({filename}) not contain 'train' or 'test'")
 
         super().__init__(data_files, tokenizer, config, processor)
+        
+        self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
 
 
     def _read_files_and_tokenize(self):
@@ -257,6 +260,45 @@ class RLHFJSONDataset(RLHFDataset):
                 self.dataframe.append(d)
 
         print(f'dataset len: {len(self.dataframe)}')
+        
+        self.dataframe = datasets.Dataset.from_list(self.dataframe)
+        self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+        
+    def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
+        # filter out too long prompts
+        if self.filter_overlong_prompts:
+            tokenizer = self.tokenizer
+            processor = self.processor
+            prompt_key = self.prompt_key
+            image_key = self.image_key
+            video_key = self.video_key
+
+            if processor is not None:
+                from verl.utils.dataset.vision_utils import process_image, process_video
+
+                def doc2len(doc) -> int:
+                    messages = self._build_messages(doc)
+                    raw_prompt = self.processor.apply_chat_template(
+                        messages, add_generation_prompt=True, tokenize=False
+                    )
+                    images = [process_image(image) for image in doc[image_key]] if image_key in doc else None
+                    videos = [process_video(video) for video in doc[video_key]] if video_key in doc else None
+
+                    return len(processor(text=[raw_prompt], images=images, videos=videos)["input_ids"][0])
+
+            else:
+
+                def doc2len(doc) -> int:
+                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+
+            dataframe = dataframe.filter(
+                lambda doc: doc2len(doc) <= self.max_prompt_length,
+                num_proc=self.num_workers,
+                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+            )
+
+            print(f"filter dataset len: {len(dataframe)}")
+        return dataframe
 
     def __getitem__(self, item):
         """
