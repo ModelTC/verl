@@ -107,6 +107,10 @@ class GPUMemoryLogger(DecoratorLoggerBase):
         return f
 
     def log(self, func, *args, **kwargs):
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            self.rank = dist.get_rank()
+        else:
+            self.rank = 0
         name = func.__name__
         mem_allocated, mem_reserved, mem_used, mem_total = _get_current_mem_info()
         message = (
