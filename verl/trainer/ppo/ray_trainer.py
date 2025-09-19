@@ -392,7 +392,6 @@ class RayPPOTrainer:
         self.on_policy = (
             self.config.actor_rollout_ref.actor.ppo_epochs == 1 
             and self.config.actor_rollout_ref.actor.ppo_mini_batch_size == self.config.data.train_batch_size
-            and self.config.actor_rollout_ref.actor.strategy == "megatron"
         )
         
     def _validate_config(self):
