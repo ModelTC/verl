@@ -24,6 +24,7 @@ class OmniRewardManager:
         self.service_url = kwargs.get('service_url', None)
         self.tool_penalty  = kwargs.get('tool_penalty', 0.0)
         self.log_num_round = kwargs.get('log_num_round', False)
+        self.judge_model_url = kwargs.get('judge_model_url', None)
 
     def __call__(self, data: DataProto, return_dict: bool=False):
         """We will expand this function gradually based on the available datasets"""
@@ -79,7 +80,7 @@ class OmniRewardManager:
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             reward_fn = compute_score_fns[data_item.non_tensor_batch['reward_model']['reward_fn']]
-
+            user_question = self.tokenizer.decode(prompt_ids).split("|im_start|>user\n")[-1].split("|im_end|")[0]
             try:
                 score = reward_fn(
                     valid_response_str, 
@@ -88,7 +89,9 @@ class OmniRewardManager:
                     service_url=self.service_url,
                     data_non_tensor_batch=data_item.non_tensor_batch,
                     tool_penalty=self.tool_penalty,
-                    is_val=is_val
+                    is_val=is_val,
+                    user_question=user_question,
+                    judge_model_url=self.judge_model_url
                 )
             except Exception as e:
                 print(f"!!!Error in reward_fn: {e}")
