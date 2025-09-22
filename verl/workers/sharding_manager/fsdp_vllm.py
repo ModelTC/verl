@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 import inspect
 import logging
 import os
 import time
 from collections import OrderedDict
 
+from omegaconf import DictConfig, OmegaConf
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
@@ -122,6 +124,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.base_sync_done: bool = "dummy" not in load_format
         if is_version_ge(pkg="vllm", minver="0.7.3"):
             VLLMHijack.hijack()
+
+        engine_kwargs = (
+            {}
+            if "engine_kwargs" not in rollout_config or "vllm" not in rollout_config.engine_kwargs
+            else OmegaConf.to_container(deepcopy(rollout_config.engine_kwargs.vllm))
+        )
+        self.fp8 = False
+        if 'quantization' in engine_kwargs and engine_kwargs['quantization'] == 'fp8':
+            self.fp8 = True
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
@@ -331,12 +342,25 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         patch_vllm_moe_model_weight_loader(model)
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-        loaded_params = model.load_weights(
-            (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in updated_params.items()
+
+
+        def get_full_tensor(param_dict):
+            for name, param in param_dict.items():
+                param_full = param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
+                yield name, param_full
+
+        print(f'!!! fp8: {self.fp8}')
+        if self.fp8:
+            from verl.workers.sharding_manager.fp8_weight_convert import weight_fuse_and_quantize_generator
+            loaded_params = model.load_weights(
+                weight_fuse_and_quantize_generator(
+                    get_full_tensor(updated_params)
+                )
             )
-        )
+        else:
+            loaded_params = model.load_weights(
+                get_full_tensor(updated_params)
+            )
 
         self.base_sync_done = True
         logger.info(f"vLLM load weights, loaded_params: {len(loaded_params) if loaded_params else -1}")

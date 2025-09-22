@@ -382,18 +382,22 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        self.on_policy = len(data.batch) <= self.config.ppo_mini_batch_size and self.config.ppo_epochs == 1
+
         select_keys = [
             "responses",
             "response_mask",
             "input_ids",
             "attention_mask",
             "position_ids",
-            "old_log_probs",
+            # "old_log_probs", # TODO: self.on_policy
             "advantages",
         ]
         if self.config.tis_imp_ratio_cap > 0:
             assert "rollout_log_probs" in data.batch.keys()
             select_keys.append("rollout_log_probs")
+        if not self.on_policy:
+            select_keys.append("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
 
@@ -426,9 +430,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
+                    advantages = model_inputs["advantages"]
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = (
@@ -443,11 +446,17 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
-                    if entropy_coeff != 0:
+                    if entropy_coeff != 0 or self.on_policy:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+
+                    if self.on_policy:
+                        old_log_prob = log_prob.detach()
+                    else:
+                        old_log_prob = model_inputs["old_log_probs"]
+
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
@@ -486,6 +495,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
+
+                        if self.on_policy:
+                            micro_batch_metrics["actor/entropy"] = entropy_loss.detach().item()
                     else:
                         policy_loss = pg_loss
 
