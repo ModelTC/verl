@@ -202,6 +202,7 @@ class InternVLModel(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
         img_token_idxs=None,
+        temperature=1.0,
     ) -> torch.Tensor:
         if self.pre_process:
             input_embeds = self.language_model.embedding(
@@ -279,6 +280,7 @@ class InternVLModel(MegatronModule):
             labels=labels,  # only not None in the last decoder PP stage
             # inference_params=inference_params,  # currently always None
             packed_seq_params=packed_seq_params,  # currently always None
+            temperature=temperature,
             **(extra_block_kwargs or {}),
         )
 
