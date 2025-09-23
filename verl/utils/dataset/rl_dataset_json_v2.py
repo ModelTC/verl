@@ -311,6 +311,7 @@ class RLHFJSONDataset(RLHFDataset):
         input_template_kwargs = row_dict['input_template'].get('arguments', {})
         prompt_with_chat_template = format_prompt_fn(self.tokenizer, chat, row_dict.get(self.image_key, None), **input_template_kwargs)
         raw_prompt = prompt_with_chat_template
+        raw_prompt = raw_prompt.replace('<image>', '<img></img>')
 
         is_multi_modal = self.image_key in row_dict and "<image>" in prompt_with_chat_template
         if is_multi_modal: 
@@ -345,6 +346,12 @@ class RLHFJSONDataset(RLHFDataset):
             output_dict['multi_modal_inputs'] = {
                 'pixel_values': pixel_values,
                 'image_flags': image_flags
+            }
+        else:
+            output_dict['multi_modal_data'] = {'image': []}
+            output_dict['multi_modal_inputs'] = {
+                'pixel_values': torch.zeros(1, 3, self.image_size, self.image_size),
+                'image_flags': torch.zeros(1, dtype=torch.long)
             }
         # else:
         #     raw_prompt = prompt_with_chat_template

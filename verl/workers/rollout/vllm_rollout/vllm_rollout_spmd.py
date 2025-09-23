@@ -293,7 +293,10 @@ class vLLMRollout(BaseRollout):
                 image_list.append({"image": [image_convert(image_item) for image_item in image]})
 
             for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), image_list, strict=True):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+                if len(multi_modal_data['image']) == 0:
+                    vllm_inputs.append({"prompt_token_ids": raw_prompt_ids})
+                else:
+                    vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
 
             if drop_multi_modal_data:
                 non_tensor_batch.pop("multi_modal_data")
