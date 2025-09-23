@@ -104,3 +104,4 @@ class FSDPEngineConfig(BaseConfig):
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
     use_orig_params: bool = False
+    flash_attn_3: bool = False
