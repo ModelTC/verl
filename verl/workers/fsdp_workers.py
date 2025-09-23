@@ -314,6 +314,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
             )
 
+            if fsdp_config.get("flash_attn_3", False):
+                print(f"Using Flash Attn 3 for {role}")
+                from verl.models.transformers.flash_attn_3 import apply_flash_attn_3
+                apply_flash_attn_3(model=actor_module)
+
             apply_monkey_patch(
                 model=actor_module,
                 use_remove_padding=use_remove_padding,
