@@ -345,6 +345,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 device_mesh=rollout_device_mesh,
                 offload_param=self._is_offload_param,
                 bridge=self.bridge,
+                set_expandable_segments=self.config.actor.optim.get("override_optimizer_config", {}).get("optimizer_cpu_offload", False),
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
