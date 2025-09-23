@@ -221,16 +221,26 @@ def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerC
 
 
 def init_megatron_optim_config(optim_config: dict) -> OptimizerConfig:
-    config = OptimizerConfig(
-        optimizer=optim_config.get("optimizer", "adam"),
-        lr=optim_config.get("lr"),
-        min_lr=optim_config.get("min_lr", None),
-        clip_grad=optim_config.get("clip_grad", 1.0),
-        weight_decay=optim_config.get("weight_decay", 0.01),
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        use_distributed_optimizer=True,
-    )
+    optim_args = {
+        "optimizer": optim_config.get("optimizer", "adam"),
+        "lr": optim_config.get("lr"),
+        "min_lr": optim_config.get("min_lr", None),
+        "clip_grad": optim_config.get("clip_grad", 1.0),
+        "weight_decay": optim_config.get("weight_decay", 0.01),
+        "bf16": True,
+        "params_dtype": torch.bfloat16,
+        "use_distributed_optimizer": True,
+    }
+
+    override_config = optim_config.get("override_optimizer_config", {})
+    if override_config:
+        for k, v in override_config.items():
+            optim_args[k] = v
+
+    if torch.distributed.get_rank() == 0:
+        print(f"optimizer config after override: {optim_args}")
+
+    config = OptimizerConfig(**optim_args)
     return config
 
 
@@ -433,12 +443,15 @@ def load_megatron_optimizer(optimizers):
 
     for _opt in _iter_opts(optimizers):
         load_megatron_copy_params(_opt)
-        opt_state_dict_values = _opt.optimizer.state.values()
-        for v in opt_state_dict_values:
-            if "exp_avg" in v:
-                v["exp_avg"] = v["exp_avg"].to(get_device_id(), non_blocking=True)
-            if "exp_avg_sq" in v:
-                v["exp_avg_sq"] = v["exp_avg_sq"].to(get_device_id(), non_blocking=True)
+        if hasattr(_opt.optimizer, "_move_new_state_to_right_device"):
+            _opt.optimizer._move_new_state_to_right_device()
+        else:
+            opt_state_dict_values = _opt.optimizer.state.values()
+            for v in opt_state_dict_values:
+                if "exp_avg" in v:
+                    v["exp_avg"] = v["exp_avg"].to(get_device_id(), non_blocking=True)
+                if "exp_avg_sq" in v:
+                    v["exp_avg_sq"] = v["exp_avg_sq"].to(get_device_id(), non_blocking=True)
         gc.collect()
         get_torch_device().empty_cache()
 

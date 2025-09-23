@@ -31,7 +31,7 @@ from verl.models.mcore.weight_converter import McoreToHFWeightConverterBase
 from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import LLM
 from verl.third_party.vllm import parallel_state as vllm_ps
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_torch_device, set_expandable_segments
 from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu, per_tensor_generator
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import GPUMemoryLogger, log_gpu_memory_usage
@@ -94,6 +94,7 @@ class MegatronVLLMShardingManager(BaseShardingManager):
         device_mesh,
         offload_param: bool = True,
         bridge=None,
+        set_expandable_segments: bool = False,
     ):
         self.actor_module = actor_module
         self.inference_engine = inference_engine
@@ -149,6 +150,8 @@ class MegatronVLLMShardingManager(BaseShardingManager):
         if 'quantization' in engine_kwargs and engine_kwargs['quantization'] == 'fp8':
             self.fp8 = True
 
+        self.set_expandable_segments = set_expandable_segments
+
     @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=logger)
     def __enter__(self):
         self.timing = {}
@@ -158,6 +161,9 @@ class MegatronVLLMShardingManager(BaseShardingManager):
             log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
             if self.offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
+
+            if self.set_expandable_segments:
+                set_expandable_segments(False)
 
             if self.rollout_config.free_cache_engine:
                 if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
@@ -207,6 +213,9 @@ class MegatronVLLMShardingManager(BaseShardingManager):
             model.train()
 
         aggressive_empty_cache(force_sync=True)
+
+        if self.set_expandable_segments:
+            set_expandable_segments(True)
 
         # restore random states
         if self.device_mesh is not None:
