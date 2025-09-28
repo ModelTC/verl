@@ -4,9 +4,9 @@ import sys
 import asyncio
 from aiohttp import web, ClientSession
 
-#BACKEND_SERVERS = ["http://10.119.30.142:8080", "http://10.119.30.142:8081"]
-MAX_CONCURRENT = 1024    
-TIMEOUTS = [60, 60]   # 3级超时时间，秒
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENCY", "512"))
+SCHEDULER_TIMEOUT = int(os.getenv("SCHEDULER_TIMEOUT", "60"))
+TIMEOUTS = [SCHEDULER_TIMEOUT]
 
 
 def extract_ips(file_path, world_size):
@@ -96,15 +96,15 @@ HOSTS_FILE = '/etc/hosts'
 PORT=8080
 
 # 提取IP
-#world_size = int(os.getenv('WORLD_SIZE', 1))
-#if world_size == 1:
-#    ips = ["127.0.0.1"]
-#else:
-#    ips = extract_ips(HOSTS_FILE, world_size)
-#BACKEND_SERVERS = [f"http://{ip}:{PORT}" for ip in ips]
+world_size = int(os.getenv('WORLD_SIZE', 1))
+if world_size == 1:
+   ips = ["127.0.0.1"]
+else:
+   ips = extract_ips(HOSTS_FILE, world_size)
+BACKEND_SERVERS = [f"http://{ip}:{PORT}" for ip in ips]
 
 
-BACKEND_SERVERS = sys.argv[1].split(',')
+# BACKEND_SERVERS = sys.argv[1].split(',')
 print(BACKEND_SERVERS)
 
 
