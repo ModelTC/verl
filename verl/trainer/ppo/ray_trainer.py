@@ -65,6 +65,28 @@ from verl.utils.tracking import ValidationGenerationsLogger
 WorkerType = type[Worker]
 
 
+# add dynamic sampling related functions
+def replace_bad_samples(mask_tensor):
+    replace_idxs = torch.nonzero(mask_tensor == 0, as_tuple=True)[0]    
+    candidate_idxs = torch.nonzero(mask_tensor == 1, as_tuple=True)[0]
+
+    num_replacements = replace_idxs.size(0)    
+    num_candidates = candidate_idxs.size(0)
+    
+    if num_candidates >= num_replacements:
+        perm = torch.randperm(num_candidates)
+        chosen_replacement_idxs = candidate_idxs[perm[:num_replacements]]
+    else:
+        indices = torch.randint(low=0, high=num_candidates, size=(num_replacements,))
+        chosen_replacement_idxs = candidate_idxs[indices]
+    
+    return replace_idxs, chosen_replacement_idxs
+
+def expand_tensor(tensor, n):
+    range_tensor = torch.arange(n)    
+    expanded = tensor.unsqueeze(1) * n + range_tensor
+    return expanded.view(-1)
+
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -1168,8 +1190,7 @@ class RayPPOTrainer:
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                )
-
+                )         
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -1231,8 +1252,6 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1250,8 +1269,103 @@ class RayPPOTrainer:
                                 compute_reward_async.remote(data, self.config, self.tokenizer) 
                                     for data in reward_batch.chunk(self.config.reward_model.reward_fn_parallel_size)
                             ]
+
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor_list = []
+                                reward_extra_infos_dict = defaultdict(list)
+                                try:
+                                    timeout = self.config.reward_model.get("reward_fn_timeout", 120)
+                                    reward_results = ray.get(reward_futures, timeout=timeout)
+                                except ray.exceptions.GetTimeoutError:
+                                    print(f"Warning: Reward function timed out after {timeout} seconds")
+                                    for future in reward_futures:
+                                        ray.cancel(future, force=True)
+                                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                                    if rollout_data_dir:
+                                        os.makedirs(rollout_data_dir, exist_ok=True)
+                                        batch.save_to_disk(f"{rollout_data_dir}/reward_timeout_data_step{self.global_steps}.pkl")
+                                    continue
+                                key2len = {}
+                                for _, extra_infos in reward_results:
+                                    for k, v in extra_infos.items():
+                                        key2len.setdefault(k, len(v)) 
+                                for (reward_t, extra_infos) in reward_results:
+                                    reward_tensor_list.append(reward_t)
+                                    for k, pad_len in key2len.items():
+                                        reward_extra_infos_dict[k].extend(extra_infos.get(k, [None] * pad_len))
+                                reward_tensor = torch.cat(reward_tensor_list, dim=0)
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(reward_batch, self.reward_fn)
+                            
+                    batch.batch["token_level_scores"] = reward_tensor
+                    # Log rollout generations if enabled
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if rollout_data_dir:
+                        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
+                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
+                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            gts = [x['ground_truth'] for x in batch.non_tensor_batch["reward_model"]]
+                            if "request_id" in batch.non_tensor_batch:
+                                reward_extra_infos_dict.setdefault(
+                                    "request_id",
+                                    batch.non_tensor_batch["request_id"].tolist(),
+                                )
+                            self._dump_generations(
+                                inputs=inputs,
+                                outputs=outputs,
+                                scores=scores,
+                                gts=gts,
+                                reward_extra_infos_dict=reward_extra_infos_dict,
+                                dump_path=rollout_data_dir,
+                            )
+                            
+                    rollout_n = self.config.actor_rollout_ref.rollout.n
+                    sum_reward_tensor = reward_tensor.sum(-1) 
+                    reward_reshaped = sum_reward_tensor.reshape(-1, rollout_n) # (batch, rollout_n)
+                    reward_score_batch = reward_reshaped.sum(dim=1) /  rollout_n # (batch, )
+
+                    solve_none = (reward_score_batch == 0).sum()
+                    solve_all = (reward_score_batch == 1).sum()
+                    metrics['batch/solve_none'] = solve_none
+                    metrics['batch/solve_all'] = solve_all
+
+
+                    # add dynamic sampling
+                    if self.config.trainer.dyn_sampling_polaris:
+                        good_mask = (0 < reward_score_batch) & (reward_score_batch < 1.0)
+                        assert len(good_mask) == self.config.data.train_batch_size 
+                        if sum(good_mask) > len(good_mask) // self.config.trainer.dyn_sampling_polaris_ratio:
+                            bad_indices_, chosen_indices_ = replace_bad_samples(good_mask) # which one are bad samples
+                            bad_indices = expand_tensor(bad_indices_, rollout_n)
+                            chosen_indices = expand_tensor(chosen_indices_, rollout_n)
+                            batch.batch['responses'][bad_indices] = batch.batch['responses'][chosen_indices]
+                            batch.batch['input_ids'][bad_indices] = batch.batch['input_ids'][chosen_indices]
+                            batch.batch['attention_mask'][bad_indices] = batch.batch['attention_mask'][chosen_indices]
+                            batch.batch['position_ids'][bad_indices] = batch.batch['position_ids'][chosen_indices] 
+                            batch.batch['prompts'][bad_indices] = batch.batch['prompts'][chosen_indices]
+                            batch.non_tensor_batch['reward_model'][bad_indices] = batch.non_tensor_batch['reward_model'][chosen_indices]
+                            print("============= from polaris dynamic sampling ===========")
+                            print("Before dynamic sampling:")
+                            print(reward_score_batch)
+                            reward_tensor[bad_indices] = reward_tensor[chosen_indices]
+                            sum_reward_tensor = reward_tensor.sum(-1) 
+                            reward_reshaped = sum_reward_tensor.reshape(-1, rollout_n) # (batch, rollout_n)
+                            reward_score_batch = reward_reshaped.sum(dim=1) /  rollout_n # (batch, )
+                            print("After dynamic sampling:")
+                            print(reward_score_batch)
+                        else:
+                            print("===================== Warning ====================")
+                            print("In this mini-batch, most training samples receive a reward of either 0 or 1. ")
+                            print("If you continue to see this warning, please check your data difficulty distribution.")
+                            print("==================================================")
+                            continue
+
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
 
                     # recompute old_log_probs
                     if not self.on_policy:
@@ -1306,36 +1420,6 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor_list = []
-                            reward_extra_infos_dict = defaultdict(list)
-                            try:
-                                timeout = self.config.reward_model.get("reward_fn_timeout", 120)
-                                reward_results = ray.get(reward_futures, timeout=timeout)
-                            except ray.exceptions.GetTimeoutError:
-                                print(f"Warning: Reward function timed out after {timeout} seconds")
-                                for future in reward_futures:
-                                    ray.cancel(future, force=True)
-                                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                                if rollout_data_dir:
-                                    os.makedirs(rollout_data_dir, exist_ok=True)
-                                    batch.save_to_disk(f"{rollout_data_dir}/reward_timeout_data_step{self.global_steps}.pkl")
-                                continue
-                            key2len = {}
-                            for _, extra_infos in reward_results:
-                                for k, v in extra_infos.items():
-                                    key2len.setdefault(k, len(v)) 
-                            for (reward_t, extra_infos) in reward_results:
-                                reward_tensor_list.append(reward_t)
-                                for k, pad_len in key2len.items():
-                                    reward_extra_infos_dict[k].extend(extra_infos.get(k, [None] * pad_len))
-                            reward_tensor = torch.cat(reward_tensor_list, dim=0)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1377,28 +1461,6 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            gts = [x['ground_truth'] for x in batch.non_tensor_batch["reward_model"]]
-                            if "request_id" in batch.non_tensor_batch:
-                                reward_extra_infos_dict.setdefault(
-                                    "request_id",
-                                    batch.non_tensor_batch["request_id"].tolist(),
-                                )
-                            self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                scores=scores,
-                                gts=gts,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
-                                dump_path=rollout_data_dir,
-                            )
 
                     # validate
                     if (
