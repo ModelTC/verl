@@ -1188,9 +1188,11 @@ class RayPPOTrainer:
                             gen_batch_output = self.chat_scheduler_wg.generate_sequences(gen_batch)
                             with marked_timer("sleep", timing_raw):
                                 self.async_rollout_manager.sleep()
-                            async_metrics = gen_batch_output.non_tensor_batch['metrics'].tolist()
-                            gen_batch_output.meta_info["timing"] = process_async_metrics(async_metrics)
-                            gen_batch_output.non_tensor_batch.pop("metrics")
+
+                            if 'metrics' in gen_batch_output.non_tensor_batch:
+                                async_metrics = gen_batch_output.non_tensor_batch['metrics'].tolist()
+                                gen_batch_output.meta_info["timing"] = process_async_metrics(async_metrics)
+                                gen_batch_output.non_tensor_batch.pop("metrics")
                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 

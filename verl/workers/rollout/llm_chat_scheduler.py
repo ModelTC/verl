@@ -72,7 +72,8 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
             conversations = []
             for choice in completions.choices:
                 chat = conversation.copy()
-                chat.append({"role": choice.message.role, "content": choice.message.content, "token_ids": choice.message.token_ids})
+                # chat.append({"role": choice.message.role, "content": choice.message.content, "token_ids": choice.message.token_ids})
+                chat.append({"role": choice.message.role, "content": choice.message.content})
                 conversations.append(chat)
             batch_conversations[batch_index] = conversations
 
@@ -126,7 +127,10 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         assert len(batch_conversations) == len(prompts["input_ids"])
         assert all(conversation[-1]['role'] == 'assistant' for conversation in batch_conversations)
 
-        responses_ids = [conversation[-1]['token_ids'] for conversation in batch_conversations]
+        # responses_ids = [conversation[-1]['token_ids'] for conversation in batch_conversations]
+        raw_prompts = batch.non_tensor_batch["raw_prompt"]
+        resp_convs = [conv[len(prompt):] for conv, prompt in zip(batch_conversations, raw_prompts)]
+        responses_ids = [self.tokenizer.apply_chat_template(conv, add_generation_prompt=False, tokenize=True) for conv in resp_convs]
         responses_ids = pad_2d_list_to_length(responses_ids, self.tokenizer.pad_token_id, max_length=self.config.response_length)
         attention_mask = get_response_mask(response_id=responses_ids, eos_token=self.tokenizer.eos_token_id)
         responses = {"input_ids": responses_ids, "attention_mask": attention_mask}

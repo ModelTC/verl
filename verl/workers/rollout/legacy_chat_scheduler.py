@@ -110,7 +110,7 @@ class ChatCompletionScheduler(Worker):
             **chat_complete_request: dict, request parameters same as OpenAI AsyncCompletions.create.
                 OpenAI API reference: https://platform.openai.com/docs/api-reference/chat/create
         """
-        metrics = callback_additional_info['metrics']
+        metrics = callback_additional_info.get('metrics', {})
         if "extra_headers" not in chat_complete_request:
             chat_complete_request["extra_headers"] = {}
 
