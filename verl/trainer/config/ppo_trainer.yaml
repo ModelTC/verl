@@ -191,6 +191,12 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # use dynamic sampling polaris
+  dyn_sampling_polaris: False
+
+  # Dynamic sampling polaris ratio
+  dyn_sampling_polaris_ratio: 3
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
