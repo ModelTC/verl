@@ -44,6 +44,8 @@ from sandbox_fusion import run_jupyter_async, RunJupyterRequest
 from verl.utils.dataset.image_processors import adaptive_resize_image, preprocess_images_internvl, preprocess_images_qwenvl, pil_to_bytes
 from verl.utils.dataset.image_processors import base64_to_pil, pil_to_base64
 
+import copy
+
 
 def repeat_each(lst, n):
     return [x for x in lst for _ in range(n)]
@@ -366,10 +368,10 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         kwargs['skip_special_tokens'] = False
 
         for batch_index, conversation in enumerate(raw_prompts):
-            if isinstance(conversation, list):
-                conversation = [self._update_message(msg) for msg in conversation]
-            else:
-                conversation = [self._update_message(msg) for msg in conversation.tolist()]
+            if not isinstance(conversation, list):
+                conversation = conversation.tolist()
+            conversation = copy.deepcopy(conversation)
+            conversation = [self._update_message(msg) for msg in conversation]
             batch_conversations[batch_index] = conversation
             batch_metrics[batch_index] = {'start_time': time.time()}
             tasks.append(
