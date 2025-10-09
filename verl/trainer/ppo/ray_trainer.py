@@ -1155,7 +1155,6 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
-
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1335,10 +1334,10 @@ class RayPPOTrainer:
 
 
                     # add dynamic sampling
-                    if self.config.trainer.dyn_sampling_polaris:
+                    if self.config.trainer.get("dyn_sampling_polaris", False):
                         good_mask = (0 < reward_score_batch) & (reward_score_batch < 1.0)
                         assert len(good_mask) == self.config.data.train_batch_size 
-                        if sum(good_mask) > len(good_mask) // self.config.trainer.dyn_sampling_polaris_ratio:
+                        if sum(good_mask) > len(good_mask) // self.config.trainer.get("dyn_sampling_polaris_ratio", 3):
                             bad_indices_, chosen_indices_ = replace_bad_samples(good_mask) # which one are bad samples
                             bad_indices = expand_tensor(bad_indices_, rollout_n)
                             chosen_indices = expand_tensor(chosen_indices_, rollout_n)
