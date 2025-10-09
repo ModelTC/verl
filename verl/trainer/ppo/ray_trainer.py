@@ -1347,6 +1347,9 @@ class RayPPOTrainer:
                             batch.batch['position_ids'][bad_indices] = batch.batch['position_ids'][chosen_indices] 
                             batch.batch['prompts'][bad_indices] = batch.batch['prompts'][chosen_indices]
                             batch.non_tensor_batch['reward_model'][bad_indices] = batch.non_tensor_batch['reward_model'][chosen_indices]
+                            # replace multimodal infos
+                            batch.non_tensor_batch['multi_modal_inputs'][bad_indices] = batch.non_tensor_batch['multi_modal_inputs'][chosen_indices]
+
                             print("============= from polaris dynamic sampling ===========")
                             print("Before dynamic sampling:")
                             print(reward_score_batch)
