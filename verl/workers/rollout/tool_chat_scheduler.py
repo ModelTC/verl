@@ -44,6 +44,8 @@ from sandbox_fusion import run_jupyter_async, RunJupyterRequest
 from verl.utils.dataset.image_processors import adaptive_resize_image, preprocess_images_internvl, preprocess_images_qwenvl, pil_to_bytes
 from verl.utils.dataset.image_processors import base64_to_pil, pil_to_base64
 
+import copy
+
 
 def repeat_each(lst, n):
     return [x for x in lst for _ in range(n)]
@@ -366,7 +368,10 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         kwargs['skip_special_tokens'] = False
 
         for batch_index, conversation in enumerate(raw_prompts):
-            conversation = [self._update_message(msg) for msg in conversation.tolist()]
+            if not isinstance(conversation, list):
+                conversation = conversation.tolist()
+            conversation = copy.deepcopy(conversation)
+            conversation = [self._update_message(msg) for msg in conversation]
             batch_conversations[batch_index] = conversation
             batch_metrics[batch_index] = {'start_time': time.time()}
             tasks.append(
@@ -518,13 +523,19 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         elif role == 'assistant':
             # get chat template
             prefix_ids = self._chat_template_prefix_suffix[role]['prefix_ids']
-            suffix_ids = self._chat_template_prefix_suffix[role]['suffix_ids_wo_eos'] if message['token_ids'][-1] == self.tokenizer.eos_token_id else self._chat_template_prefix_suffix[role]['suffix_ids']
-
-            # apply chat template
-            message['token_ids'] = prefix_ids + message['token_ids'] + suffix_ids
-            message['token_ids_for_train'] = message['token_ids']
-            message['logprobs'] = [0.0] * len(prefix_ids) + message['logprobs'] + [0.0] * len(suffix_ids)
-            message['response_mask'] = [0] * len(prefix_ids) + message['response_mask'] + [0] * len(suffix_ids)
+            if 'token_ids' in message:
+                suffix_ids = self._chat_template_prefix_suffix[role]['suffix_ids_wo_eos'] if message['token_ids'][-1] == self.tokenizer.eos_token_id else self._chat_template_prefix_suffix[role]['suffix_ids']
+                # apply chat template
+                message['token_ids'] = prefix_ids + message['token_ids'] + suffix_ids
+                message['token_ids_for_train'] = message['token_ids']
+                message['logprobs'] = [0.0] * len(prefix_ids) + message['logprobs'] + [0.0] * len(suffix_ids)
+                message['response_mask'] = [0] * len(prefix_ids) + message['response_mask'] + [0] * len(suffix_ids)
+            else:
+                token_ids_for_train, token_ids_for_gen = self._message_to_token(message)
+                message['token_ids'] = token_ids_for_gen
+                message['token_ids_for_train'] = token_ids_for_train
+                message['logprobs'] = [0.0] * len(token_ids_for_train)
+                message['response_mask'] = [0] * len(token_ids_for_train)
 
         else:
             raise ValueError(f"Unknown role: {role}")

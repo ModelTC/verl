@@ -102,6 +102,9 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source in ["rlla_new"]:
+        from verl.utils.reward_score import toolrl
+        res = toolrl.compute_score(solution_str, ground_truth, extra_info=extra_info)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

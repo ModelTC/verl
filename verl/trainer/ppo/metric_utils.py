@@ -105,11 +105,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, reward_extra
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
     
     if "format_score" in batch.non_tensor_batch:
-        sequence_score_format = batch.non_tensor_batch['format_score']
+        sequence_score_format = torch.from_numpy(batch.non_tensor_batch['format_score'])
     if "correctness_score" in batch.non_tensor_batch:
-        sequence_score_correctness = batch.non_tensor_batch['correctness_score']
+        sequence_score_correctness = torch.from_numpy(batch.non_tensor_batch['correctness_score'])
     if "length_score" in batch.non_tensor_batch:
-        sequence_score_length = batch.non_tensor_batch['length_score']
+        sequence_score_length = torch.from_numpy(batch.non_tensor_batch['length_score']).to(dtype=torch.float)
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
@@ -176,6 +176,33 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, reward_extra
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+    if "format_score" in batch.non_tensor_batch:
+        metrics.update(
+            {
+                # reward
+                "critic/format_score/mean": torch.mean(sequence_score_format).detach().item(),
+                "critic/format_score/max": torch.max(sequence_score_format).detach().item(),
+                "critic/format_score/min": torch.min(sequence_score_format).detach().item(),
+            }
+        )
+    if "correctness_score" in batch.non_tensor_batch:
+        metrics.update(
+            {
+                # reward
+                "critic/correctness_score/mean": torch.mean(sequence_score_correctness).detach().item(),
+                "critic/correctness_score/max": torch.max(sequence_score_correctness).detach().item(),
+                "critic/correctness_score/min": torch.min(sequence_score_correctness).detach().item(),
+            }
+        )
+    if "length_score" in batch.non_tensor_batch:
+        metrics.update(
+            {
+                # reward
+                "critic/length_score/mean": torch.mean(sequence_score_length).detach().item(),
+                "critic/length_score/max": torch.max(sequence_score_length).detach().item(),
+                "critic/length_score/min": torch.min(sequence_score_length).detach().item(),
+            }
+        )
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
