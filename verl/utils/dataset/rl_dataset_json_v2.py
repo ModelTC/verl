@@ -261,7 +261,7 @@ class RLHFJSONDataset(RLHFDataset):
 
         print(f'dataset len: {len(self.dataframe)}')
         
-        self.dataframe = datasets.Dataset.from_list(self.dataframe)
+        # self.dataframe = datasets.Dataset.from_list(self.dataframe)
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
         
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
@@ -291,14 +291,21 @@ class RLHFJSONDataset(RLHFDataset):
                 def doc2len(doc) -> int:
                     return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
 
-            dataframe = dataframe.filter(
-                lambda doc: doc2len(doc) <= self.max_prompt_length,
-                num_proc=self.num_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
-            )
+            def _keep(doc, doc2len, max_prompt_length):
+                return doc if doc2len(doc) <= max_prompt_length else None
 
-            print(f"filter dataset len: {len(dataframe)}")
-        return dataframe
+            from functools import partial
+            from concurrent.futures import ThreadPoolExecutor
+            keep_fn = partial(_keep, doc2len=doc2len, max_prompt_length=self.max_prompt_length)
+
+            with ThreadPoolExecutor() as pool:
+                # map 保持顺序，filter 去掉 None
+                filter_dataframe = list(
+                    filter(None, pool.map(keep_fn, dataframe))   # dataframe 是 list[dict]
+                )
+
+            print(f"filter dataset len: {len(filter_dataframe)}")
+        return filter_dataframe
 
     def __getitem__(self, item):
         """
