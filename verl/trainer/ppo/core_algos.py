@@ -812,10 +812,15 @@ def compute_policy_loss(
     if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
         # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
         tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
-        tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
+        if config.get('IcePop', None) is not None:         # Apply IcePop in Ring-mini-2.0
+            alpha = config.IcePop.get("alpha", 0.8)
+            beta = config.IcePop.get("beta", 1.2)
+            mask = (tis_imp_ratio >= alpha) & (tis_imp_ratio <= beta)
+            tis_imp_ratio *= mask
+        else:
+            tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
         pg_losses = pg_losses * tis_imp_ratio
         tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
-
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     if config.tis_imp_ratio_cap > 0:
@@ -833,6 +838,7 @@ def compute_policy_loss_gspo(
     response_mask: torch.Tensor,
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_log_probs: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -878,6 +884,19 @@ def compute_policy_loss_gspo(
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
 
+    if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
+        # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
+        tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
+        if config.get('IcePop', None) is not None:         # Apply IcePop in Ring-mini-2.0
+            alpha = config.IcePop.get("alpha", 0.8)
+            beta = config.IcePop.get("beta", 1.2)
+            mask = (tis_imp_ratio >= alpha) & (tis_imp_ratio <= beta)
+            tis_imp_ratio *= mask
+        else:
+            tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
+        pg_losses = pg_losses * tis_imp_ratio
+        tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
+
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
 
@@ -887,7 +906,10 @@ def compute_policy_loss_gspo(
 
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    if config.tis_imp_ratio_cap > 0:
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean
+    else:
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 @register_policy_loss("gspo_token")
@@ -898,6 +920,7 @@ def compute_policy_loss_gspo(
     response_mask: torch.Tensor,
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_log_probs: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -942,6 +965,19 @@ def compute_policy_loss_gspo(
     pg_losses1 = -advantages * seq_importance_ratio
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    
+    if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
+        # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
+        tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
+        if config.get('IcePop', None) is not None:         # Apply IcePop in Ring-mini-2.0
+            alpha = config.IcePop.get("alpha", 0.8)
+            beta = config.IcePop.get("beta", 1.2)
+            mask = (tis_imp_ratio >= alpha) & (tis_imp_ratio <= beta)
+            tis_imp_ratio *= mask
+        else:
+            tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
+        pg_losses = pg_losses * tis_imp_ratio
+        tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
 
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
@@ -951,8 +987,12 @@ def compute_policy_loss_gspo(
     pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
 
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    
+    if config.tis_imp_ratio_cap > 0:
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean
+    else:
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 @register_policy_loss("gpg")

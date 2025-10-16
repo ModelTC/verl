@@ -462,14 +462,19 @@ class MegatronPPOActor(BasePPOActor):
 
                 else:
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    ret = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
+                        rollout_log_probs=rollout_log_probs
                     )
+                    if self.config.tis_imp_ratio_cap > 0:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean = ret
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = ret
 
                 stats.update(
                     {
