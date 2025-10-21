@@ -17,13 +17,19 @@ def compute_score(solution_str, ground_truth, extra_info=dict()):
         score: the score for the correct answer
     """
     # assert "step" in extra_info, "step not extra_info!"
-    exp_name, step = str(os.getenv("EXPERIMENT_NAME", "")), extra_info.get("step", 0)
-    if "llama" in exp_name:
-        predict_str = solution_str.split("<|start_header_id|>assistant<|end_header_id|>")[-1].split("<|eot_id|>")[0].strip()
-    elif "qwen" in exp_name:
-        predict_str = solution_str.split("<|im_start|>assistant")[-1].split("<|im_end|>")[0].strip()
+    step = extra_info.get("step", 0)
+    if "extract_pattern" in extra_info:
+        matches = re.findall(
+            extra_info["extract_pattern"], solution_str, re.DOTALL)
+        predict_str = matches[-1].strip() if len(matches) > 0 else ""
     else:
-        raise NotImplementedError(f"Unknown model name: {exp_name}")
+        exp_name = str(os.getenv("EXPERIMENT_NAME", ""))
+        if "llama" in exp_name:
+            predict_str = solution_str.split("<|start_header_id|>assistant<|end_header_id|>")[-1].split("<|eot_id|>")[0].strip()
+        elif "qwen" in exp_name:
+            predict_str = solution_str.split("<|im_start|>assistant")[-1].split("<|im_end|>")[0].strip()
+        else:
+            raise NotImplementedError(f"Unknown model name: {exp_name}")
     
     if str(os.getenv("CORRECTMAX1", 0)) == "1":
         print("CORRECTMAX1 is set to 1, so max score is set to 1")
@@ -149,7 +155,12 @@ def customize_correctness_reward_tool(completions, answer, step, max_possible_re
 
         pattern = r'<tool_call>(.*?)</tool_call>'
         gt_tools = re.findall(pattern, ans, re.DOTALL)
-        gt_tools = [json.loads(tool) for tool in gt_tools]
+        gt_tools = [
+            json.loads(tool)
+            for tool_block in gt_tools
+            for tool in tool_block.split("\n")
+            if len(tool.strip("\n")) > 0
+        ]
         
         try:
             # Change here as a constrint in training: if the format is not correct, directly give the lowest possible score
@@ -157,7 +168,12 @@ def customize_correctness_reward_tool(completions, answer, step, max_possible_re
             assert "</tool_call>" in response
             pattern = r'<tool_call>(.*?)</tool_call>'
             pd_tools = re.findall(pattern, response, re.DOTALL)
-            pd_tools = [json.loads(tool) for tool in pd_tools]
+            pd_tools = [
+                json.loads(tool)
+                for tool_block in pd_tools
+                for tool in tool_block.split("\n")
+                if len(tool.strip("\n")) > 0
+            ]
             reward = compute_tool_call_reward(gt_tools, pd_tools, max_possible_reward, min_possible_reward) # top reward is 2
         except:
             reward = min_possible_reward
