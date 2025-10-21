@@ -1,10 +1,8 @@
 from verl import DataProto
 import torch
 import json
-import pickle
-import zlib
-import base64
 from collections import defaultdict
+from verl.common import make_object_from_config
 from verl.utils.dataset.utils import IMG_CONTEXT_TOKEN, PAD_TOKEN, IMG_CONTEXT_TOKEN_QWEN
 from verl.utils.reward_score.omni_reward import compute_score_fns
 from verl.workers.reward_manager import register
@@ -12,12 +10,28 @@ from verl.utils.reward_score.utils import ErrCode
 
 @register("omni")
 class OmniRewardManager:
+
+    @staticmethod
+    def get_reward_function(reward_function_dict: dict, reward_indicator):
+        if isinstance(reward_indicator, str):
+            return reward_function_dict[reward_indicator]
+        elif isinstance(reward_indicator, dict):
+            func_key = json.dumps(reward_indicator, sort_keys=True)
+            if func_key not in reward_function_dict:
+                reward_function_dict[func_key] = make_object_from_config(
+                    reward_indicator)
+
+            return reward_function_dict[func_key]
+        else:
+            raise NotImplementedError(
+                "The reward indicator should be str or dict.")
+
     """The reward manager.
     """
     def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", **kwargs) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
-        self.compute_score = compute_score_fns
+        self.compute_score = compute_score_fns.copy()
         self.reward_fn_key = reward_fn_key
 
         self.is_val = kwargs.get('is_val', False)
@@ -79,7 +93,10 @@ class OmniRewardManager:
             valid_response_str = self.tokenizer.decode(valid_response_ids)
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-            reward_fn = compute_score_fns[data_item.non_tensor_batch['reward_model']['reward_fn']]
+            reward_fn = OmniRewardManager.get_reward_function(
+                self.compute_score,
+                data_item.non_tensor_batch['reward_model']['reward_fn'],
+            )
             user_question = self.tokenizer.decode(prompt_ids).split("|im_start|>user\n")[-1].split("|im_end|")[0]
             try:
                 score = reward_fn(

@@ -254,9 +254,16 @@ class RLHFJSONDataset(RLHFDataset):
 
                 assert 'input_template' in dataset_info, f"input_template not found in dataset_info"
                 d['input_template'] = dataset_info['input_template']
-                assert 'reward_fn' in dataset_info, f"reward_fn not found in dataset_info"
-                d['reward_model']['reward_fn'] = dataset_info['reward_fn']
-                
+
+                if (
+                    'reward_fn' in dataset_info and
+                    'reward_fn' not in d['reward_model']
+                ):
+                    d['reward_model']['reward_fn'] = dataset_info['reward_fn']
+
+                assert 'reward_fn' in d['reward_model'], \
+                    f"reward_model.reward_fn is not defined for {d['id']}"
+
                 self.dataframe.append(d)
 
         print(f'dataset len: {len(self.dataframe)}')
