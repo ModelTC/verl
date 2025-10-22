@@ -278,6 +278,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
                 optimizer=actor_optimizer, config=optim_config
             )
+            for group in actor_optimizer.param_groups:
+                for param in group["params"]:
+                    param.grad = torch.zeros_like(param)
+            actor_optimizer.step()
+            actor_optimizer.zero_grad()
         else:
             optim_config = None
             actor_optimizer = None
