@@ -335,6 +335,7 @@ class RLHFJSONDataset(RLHFDataset):
                     continue
                 elif segment == "<image>":
                     image = images.pop(0)
+                    wh = image.size
                     img_byte_arr = io.BytesIO()
                     image.save(img_byte_arr, format='PNG')
                     img_byte_arr = img_byte_arr.getvalue()
@@ -343,9 +344,12 @@ class RLHFJSONDataset(RLHFDataset):
                     content_list.append({
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{img_base64}"
+                            "url": f"data:image/png;base64,{img_base64}",
+                            "w": wh[0],
+                            "h": wh[1]
                         },
                     })
+                    content_list.append({"type": "text", "text": "<img></img>"})
                 else:
                     content_list.append({"type": "text", "text": segment})
 
@@ -365,7 +369,7 @@ class RLHFJSONDataset(RLHFDataset):
 
         format_prompt_fn = format_prompt_fns[row_dict['input_template']['name']]
         input_template_kwargs = row_dict['input_template'].get('arguments', {})
-        prompt_with_chat_template = format_prompt_fn(self.tokenizer, chat, row_dict.get(self.image_key, None), **input_template_kwargs)
+        prompt_with_chat_template = format_prompt_fn(self.tokenizer, chat, row_dict.get(self.image_key, None), **input_template_kwargs) # will change chat inplace
         raw_prompt = prompt_with_chat_template
         raw_prompt = raw_prompt.replace('<image>', '<img></img>')
 
