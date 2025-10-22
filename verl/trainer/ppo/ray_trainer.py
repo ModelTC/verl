@@ -731,6 +731,10 @@ class RayPPOTrainer:
                 test_output_gen_batch_padded = self.chat_scheduler_wg.generate_sequences(test_gen_batch_padded)
                 self.async_rollout_manager.sleep()
 
+                if 'multi_modal_inputs' in test_output_gen_batch_padded.non_tensor_batch:
+                    if 'mutli_modal_inputs' in test_batch.non_tensor_batch:
+                        test_batch.pop(non_tensor_batch_keys=["multi_modal_inputs"])
+
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
@@ -1209,10 +1213,15 @@ class RayPPOTrainer:
                             with marked_timer("sleep", timing_raw):
                                 self.async_rollout_manager.sleep()
 
+                            if "multi_modal_inputs" in gen_batch_output.non_tensor_batch.keys():
+                                if "multi_modal_inputs" in batch.non_tensor_batch.keys():
+                                    batch.pop(non_tensor_batch_keys=["multi_modal_inputs"])
+
                             if 'metrics' in gen_batch_output.non_tensor_batch:
                                 async_metrics = gen_batch_output.non_tensor_batch['metrics'].tolist()
                                 gen_batch_output.meta_info["timing"] = process_async_metrics(async_metrics)
                                 gen_batch_output.non_tensor_batch.pop("metrics")
+
                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 

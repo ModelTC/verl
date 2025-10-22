@@ -413,10 +413,18 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
     def _postprocess(self, batch: DataProto, batch_conversations) -> DataProto:
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
 
+        batch_input_ids = []
         batch_resp_ids, batch_loss_mask, batch_logps = [], [], []
         multi_modal_inputs = []
         multi_modal_data = []
         for prompt, convs in zip(raw_prompts, batch_conversations):
+
+            input_convs = convs[:len(prompt)]
+            input_ids = []
+            for message in input_convs:
+                input_ids.extend(message['token_ids_for_train'])
+            batch_input_ids.append(input_ids)
+
             resp_convs = convs[len(prompt):]
             resp_ids, loss_mask, logprobs = [], [], []
             whole_images = []
@@ -426,6 +434,11 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 loss_mask.extend(message['response_mask'])
                 logprobs.extend(message['logprobs'])
 
+            batch_resp_ids.append(resp_ids)
+            batch_loss_mask.append(loss_mask)
+            batch_logps.append(logprobs)
+
+            for message in convs:
                 if isinstance(message['content'], list):
                     for part in message['content']:
                         if 'image_url' in part:
@@ -434,18 +447,22 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                                 image = base64_to_pil(image)
                             whole_images.append(image)
 
-            batch_resp_ids.append(resp_ids)
-            batch_loss_mask.append(loss_mask)
-            batch_logps.append(logprobs)
-
             if self.data_config.get('use_image_bytes', False):
                 multi_modal_data.append({"image": whole_images})
             else:
                 image_inputs = self._build_multi_modal_input(whole_images)
                 multi_modal_inputs.append(image_inputs)
+
         # prompts: [prompt] from input dataset
-        prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
-        prompts = self.tokenizer(prompts, return_tensors="pt", padding="max_length", max_length=self.max_prompt_length, padding_side="left")
+        # prompts = [self.tokenizer.apply_chat_template(prompt, add_generation_prompt=False, tokenize=False) for prompt in raw_prompts]
+        # prompts = self.tokenizer(prompts, return_tensors="pt", padding="max_length", max_length=self.max_prompt_length, padding_side="left")
+        
+        input_ids = pad_2d_list_to_length(batch_input_ids, self.tokenizer.pad_token_id, max_length=self.max_prompt_length, padding_side="left")
+        # input_attention_mask = get_response_mask(response_id=input_ids, eos_token=self.tokenizer.pad_token_id)
+        prompts = {
+            "input_ids": input_ids,
+            "attention_mask": (input_ids != self.tokenizer.pad_token_id).to(torch.int64),
+        }
 
         assert len(batch_conversations) == len(prompts["input_ids"])
         assert all(conversation[-1]['role'] == 'assistant' for conversation in batch_conversations)

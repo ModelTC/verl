@@ -304,13 +304,16 @@ def split_dict_tensor_into_batches(tensors: TensorDict, batch_size) -> list[Tens
     return tensors.split(batch_size)
 
 
-def pad_2d_list_to_length(response, pad_token_id, max_length=None):
+def pad_2d_list_to_length(response, pad_token_id, max_length=None, padding_side="right"):
     """
     pad a 2D list (e.g. responses, logprobs) to a 2D tensor.
     """
     response_length = max(len(sub_list) for sub_list in response)
     target_length = max_length if max_length is not None and max_length > response_length else response_length
-    padded_response = [tuple(sub_list) + (pad_token_id,) * (target_length - len(sub_list)) for sub_list in response]
+    if padding_side == "left":
+        padded_response = [(pad_token_id,) * (target_length - len(sub_list)) + tuple(sub_list) for sub_list in response]
+    else:
+        padded_response = [tuple(sub_list) + (pad_token_id,) * (target_length - len(sub_list)) for sub_list in response]
     tensor = torch.tensor(padded_response)
     return tensor
 
