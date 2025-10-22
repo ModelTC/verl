@@ -381,8 +381,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
-
-        self.on_policy = len(data.batch) <= self.config.ppo_mini_batch_size and self.config.ppo_epochs == 1
+        if self.config.get('auto_on_policy', False):
+            self.on_policy = len(data.batch) <= self.config.ppo_mini_batch_size and self.config.ppo_epochs == 1
+        else:
+            self.on_policy = False
 
         select_keys = [
             "responses",
@@ -481,14 +483,19 @@ class DataParallelPPOActor(BasePPOActor):
 
                     else:
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                        ret = policy_loss_fn(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
                             response_mask=response_mask,
                             loss_agg_mode=loss_agg_mode,
                             config=self.config,
+                            rollout_log_probs=rollout_log_probs
                         )
+                        if self.config.tis_imp_ratio_cap > 0:
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean = ret
+                        else:
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = ret
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

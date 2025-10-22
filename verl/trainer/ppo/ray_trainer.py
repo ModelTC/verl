@@ -410,11 +410,13 @@ class RayPPOTrainer:
         self.scheduler_kwargs = OmegaConf.to_container(self.config.actor_rollout_ref.rollout.get("chat_scheduler_kwargs", OmegaConf.create()))
         if self.scheduler_kwargs.pop('use_data_config', False):
             self.scheduler_kwargs['data_config'] = self.config.data
-
-        self.on_policy = (
-            self.config.actor_rollout_ref.actor.ppo_epochs == 1 
-            and self.config.actor_rollout_ref.actor.ppo_mini_batch_size == self.config.data.train_batch_size
-        )
+        if self.config.actor_rollout_ref.actor.get('auto_on_policy', False):
+            self.on_policy = (
+                self.config.actor_rollout_ref.actor.ppo_epochs == 1 
+                and self.config.actor_rollout_ref.actor.ppo_mini_batch_size == self.config.data.train_batch_size
+            )
+        else:
+            self.on_policy = False
         
     def _validate_config(self):
         config = self.config
