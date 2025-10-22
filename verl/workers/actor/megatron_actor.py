@@ -295,7 +295,10 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
 
         """
-        self.on_policy = len(data.batch) <= self.config.ppo_mini_batch_size and self.config.ppo_epochs == 1
+        if self.config.get('auto_on_policy', False):
+            self.on_policy = len(data.batch) <= self.config.ppo_mini_batch_size and self.config.ppo_epochs == 1
+        else:
+            self.on_policy = False
 
         select_keys = [
             "responses",

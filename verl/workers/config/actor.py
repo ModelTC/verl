@@ -111,6 +111,7 @@ class ActorConfig(BaseConfig):
     use_fused_kernels: bool = False
     tis_imp_ratio_cap: float = -1.0
     IcePop: Optional[dict] = None
+    auto_on_policy: bool = False
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
