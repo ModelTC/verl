@@ -734,7 +734,7 @@ class RayPPOTrainer:
                 self.async_rollout_manager.sleep()
 
                 if 'multi_modal_inputs' in test_output_gen_batch_padded.non_tensor_batch:
-                    if 'mutli_modal_inputs' in test_batch.non_tensor_batch:
+                    if 'multi_modal_inputs' in test_batch.non_tensor_batch:
                         test_batch.pop(non_tensor_batch_keys=["multi_modal_inputs"])
 
             # unpad
