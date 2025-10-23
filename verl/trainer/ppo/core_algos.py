@@ -974,10 +974,12 @@ def compute_policy_loss_gspo(
             beta = config.IcePop.get("beta", 1.2)
             mask = (tis_imp_ratio >= alpha) & (tis_imp_ratio <= beta)
             tis_imp_ratio *= mask
+            tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask * mask)
         else:
             tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
+            tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
         pg_losses = pg_losses * tis_imp_ratio
-        tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
+
 
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
