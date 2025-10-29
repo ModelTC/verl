@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
 import time
 from typing import Any, Dict, List
@@ -294,13 +295,15 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
             assert exception is None, f"exception: {exception}, {type(exception)=} {info['response_length']=}, {self.max_response_length=} {info['turn']=}"
 
-            batch_conversations, batch_index, cells, turn, response_length, metrics = (
+            batch_conversations, batch_index, cells, turn, max_turns, response_length, metrics, current_kwargs = (
                 info["batch_conversations"],
                 info["batch_index"],
                 info["cells"],
                 info["turn"],
+                info["max_turns"],
                 info["response_length"],
-                info["metrics"]
+                info["metrics"],
+                info["kwargs"]
             )
 
             # process the response from completions
@@ -321,7 +324,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             batch_conversations[batch_index].append(message)
             response_length += len(message['token_ids_for_train'])
 
-            if turn == self.max_turns or response_length > self.max_response_length:
+            if turn == max_turns or response_length > self.max_response_length:
                 metrics['end_time'] = time.time()
                 return
 
@@ -349,13 +352,15 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                     "batch_index": batch_index,
                     "cells": cells,
                     "turn": turn + 1,
+                    "max_turns": max_turns,
                     "response_length": response_length,
-                    "metrics": metrics
+                    "metrics": metrics,
+                    "kwargs": current_kwargs
                 },
                 model=self.model_name,
                 messages=batch_conversations[batch_index] + [{"role": "assistant", "token_ids": self._chat_template_prefix_suffix['assistant']['prefix_ids']}],
                 extra_headers=extra_headers,
-                **kwargs,
+                **current_kwargs,
             )
 
 
@@ -374,6 +379,20 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             conversation = [self._update_message(msg) for msg in conversation]
             batch_conversations[batch_index] = conversation
             batch_metrics[batch_index] = {'start_time': time.time()}
+
+            if "max_turns" in batch.non_tensor_batch and batch.non_tensor_batch["max_turns"][batch_index] != -1:
+                max_turns = batch.non_tensor_batch["max_turns"][batch_index]
+            else:
+                max_turns = self.max_turns
+            if "single_response_length" in batch.non_tensor_batch and batch.non_tensor_batch["single_response_length"][batch_index] != -1:
+                single_response_length = batch.non_tensor_batch["single_response_length"][batch_index]
+            else:
+                single_response_length = self.config.response_length
+
+            new_kwargs = copy.deepcopy(kwargs)
+            new_kwargs['max_completion_tokens'] = single_response_length
+            new_kwargs['max_tokens'] = single_response_length
+
             tasks.append(
                 asyncio.create_task(
                     self.submit_chat_completions(
@@ -383,12 +402,14 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                             "batch_index": batch_index,
                             "cells": [],
                             "turn": 1,
+                            "max_turns": max_turns,
                             "response_length": 0,
-                            "metrics": batch_metrics[batch_index]
+                            "metrics": batch_metrics[batch_index],
+                            "kwargs": new_kwargs
                         },
                         model=self.model_name,
                         messages=conversation + [{"role": "assistant", "token_ids": self._chat_template_prefix_suffix['assistant']['prefix_ids']}],
-                        **kwargs,
+                        **new_kwargs,
                     )
                 )
             )

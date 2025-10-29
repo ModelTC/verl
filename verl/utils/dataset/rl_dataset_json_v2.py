@@ -264,6 +264,9 @@ class RLHFJSONDataset(RLHFDataset):
                 assert 'reward_fn' in d['reward_model'], \
                     f"reward_model.reward_fn is not defined for {d['id']}"
 
+                d['max_turns'] = dataset_info.get('max_turns', -1)
+                d['single_response_length'] = dataset_info.get('single_response_length', -1)
+
                 self.dataframe.append(d)
 
         print(f'dataset len: {len(self.dataframe)}')
@@ -321,7 +324,10 @@ class RLHFJSONDataset(RLHFDataset):
         row_dict: dict = copy.deepcopy(self.dataframe[item])
         preprocess_fn = self._internvl_preprocess if self.apply_internvl_preprocess else self._default_preprocess
         try:
-            return preprocess_fn(row_dict)
+            output_dict = preprocess_fn(row_dict)
+            output_dict['max_turns'] = row_dict['max_turns']
+            output_dict['single_response_length'] = row_dict['single_response_length']
+            return output_dict
         except Exception as e:
             print(f"Error: {e}\ndata id: {row_dict['id']}")
             return self.__getitem__((item + 1) % len(self.dataframe))
