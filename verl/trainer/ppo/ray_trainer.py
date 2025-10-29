@@ -1183,6 +1183,10 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "max_turns" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("max_turns")
+                if "single_response_length" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("single_response_length")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 if "interaction_kwargs" in batch.non_tensor_batch:
