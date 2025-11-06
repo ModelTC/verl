@@ -18,7 +18,7 @@ import logging
 from typing import Any
 
 from fastmcp import Client
-from fastmcp.client.transports import SSETransport
+from fastmcp.client.transports import SSETransport, StdioTransport
 
 from verl.tools.utils.mcp_clients.utils import TokenBucket, mcp2openai
 
@@ -41,12 +41,18 @@ class MCPClientManager:
         exclude_sse_servers = {self.rootServerName: {}}
         for server_name in servers.keys():
             server = servers[server_name]
-            if "auth_token" in server:
-                transport = SSETransport(url=server["url"], headers={"Authorization": f"Bearer {server['auth_token']}"})
+            if 'command' in server:
+                print(f"!!!! Using STDIO transport for {server_name}", server)
+                transport = StdioTransport(command=server["command"], args=server.get('args', []), env=server.get('env', {}))
                 client = Client(transport)
                 self.clients.append(client)
-            else:
-                exclude_sse_servers[self.rootServerName][server_name] = server
+            elif "url" in server:
+                if "auth_token" in server:
+                    transport = SSETransport(url=server["url"], headers={"Authorization": f"Bearer {server['auth_token']}"})
+                    client = Client(transport)
+                    self.clients.append(client)
+                else:
+                    exclude_sse_servers[self.rootServerName][server_name] = server
 
         if exclude_sse_servers[self.rootServerName]:
             self.clients.append(Client(exclude_sse_servers))
@@ -62,7 +68,7 @@ class MCPClientManager:
 
         client = self.get_client_with_tool_name(tool_name)
         async with client:
-            return await client.call_tool_mcp(tool_name, parameters)
+            return await client.call_tool_mcp(tool_name, parameters, timeout)
 
     async def fetch_tool_schemas(self, tool_selected_list: list[str]) -> list[dict]:
         tool_schemas = []

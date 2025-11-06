@@ -113,4 +113,4 @@ class MCPBaseTool(BaseTool):
 
     def _parse_tool_result(self, content: list) -> tuple[str, dict]:
         tools_content = [part.text for part in filter(lambda x: x.type == "text", content)]
-        return " ".join(tools_content), {}
+        return " ".join(tools_content), {"api_request_error": "", "status": "success", "total_results": len(tools_content)}

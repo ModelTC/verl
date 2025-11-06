@@ -983,6 +983,7 @@ class RayPPOTrainer:
                     **self.scheduler_kwargs
                 )
                 self.chat_scheduler_wg = RayWorkerGroup(resource_pool, cls_with_args)
+                self.chat_scheduler_wg.init_tools()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
