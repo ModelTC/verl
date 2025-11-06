@@ -81,6 +81,18 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         if type(self) is ToolChatCompletionScheduler:
             raise TypeError("ToolChatCompletionScheduler is an abstract class and should not be instantiated directly.")
 
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def init_tools(self):
+        self.tool_config_path = self.config.get('multi_turn', {}).get('tool_config_path', None)
+        if self.tool_config_path:
+            from verl.tools.utils.tool_registry import initialize_tools_from_config_async
+            self.tools = await initialize_tools_from_config_async(self.tool_config_path)
+        else:
+            self.tools = []
+        self.tool_map = {tool.name: tool for tool in self.tools}
+
+
     def _message_to_token(self, message):
         if isinstance(message['content'], str):
             token_ids = self.tokenizer.apply_chat_template(
@@ -136,6 +148,107 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         else:
             print("[ToolChatCompletionScheduler] Warning: no cells in response")
             return
+
+    async def python_code_interpreter(self, cells, name, arguments):
+        # 1.4 目前只支持 'python' 工具
+        if name != 'python':
+            return
+
+
+        code = arguments.get('code')
+        if not code:
+            return
+
+        # === 2. 执行代码并获取结果 ===
+        cells.append(code)
+        result = await self.sandbox_run_jupyter(cells)
+        if not result:
+            return
+
+        # === 3. 处理执行结果，构建 content (核心优化部分) ===
+        # 采用更清晰的 if/elif/else 结构，一次性构建好最终的 content
+        content = []
+        # 情况一：执行成功，有输出（stdout 或 display 数据）
+        if result.stdout or result.display:
+            texts = []
+            images = []
+
+            if result.stdout:
+                texts.append(result.stdout)
+
+            for item in result.display:
+                try:
+                    if "image/png" in item:
+                        # 图像处理逻辑
+                        process = False
+                        if hasattr(self, "_need_process"):
+                            wh = Image.open(io.BytesIO(base64.b64decode(item['image/png']))).size
+                            if self._need_process(wh[0], wh[1]):
+                                process = True
+                        else:
+                            process = True
+                        if process:
+                            image = base64_to_pil(item['image/png'])
+                            image = self._process_image(image)
+                            image_base64 = pil_to_base64(image)
+                            wh = Image.open(io.BytesIO(base64.b64decode(image_base64))).size
+                        else:
+                            image_base64 = item['image/png']
+
+                        images.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_base64}",
+                                        "w": wh[0],
+                                        "h": wh[1]}
+                        })
+                        texts.append(self.image_tag)
+                    if 'text/plain' in item:
+                        texts.append(item['text/plain'])
+                except Exception as e:
+                    # 如果单个 display item 处理失败，跳过它，而不是中断整个流程
+                    print(e)
+                    continue
+
+            # 将收集到的文本和图片组装成最终的 content 格式
+            if texts:
+                texts.insert(0, '<tool_response>')
+                texts.append('</tool_response>')
+                content.append({"type": "text", "text": '\n'.join(texts).strip()})
+            if images:
+                content.extend(images)
+
+        # 情况二：执行出错
+        elif result.error and isinstance(result.error, list) and result.error:
+            try:
+                trace = '\n'.join(result.error[0].get('traceback', []))
+                # 移除 ANSI 颜色代码
+                ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+                clean_trace = ansi_escape.sub('', trace)
+                content = [{"type": "text", "text": clean_trace}]
+            except (TypeError, AttributeError):
+                # 如果错误格式不规范，返回一个通用错误信息
+                content = [{"type": "text", "text": "<tool_response>\n[An unknown error occurred during execution.]\n</tool_response>"}]
+
+        # 情况三：执行成功，但没有任何输出
+        else:
+            content = [{"type": "text", "text": "<tool_response>\n[Execution completed with no output.]\n</tool_response>"}]
+
+        return content
+
+    async def tool_call_execute(self, tool_name, arguments):
+        instance_id = None
+        try:
+            tool = self.tool_map[tool_name]
+            instance_id = await tool.create()
+            tool_response, _, _ = await tool.execute(instance_id, arguments)
+            content = [{"type": "text", "text": "<tool_response>\n" + tool_response.strip() + "\n</tool_response>"}]
+            return content
+        except Exception as e:
+            print(f"Error when executing tool: {e}")
+            return [{"type": "text", "text": f"<tool_response>\n[Error when executing tool: {e}]\n</tool_response>"}]
+        finally:
+            if instance_id:
+                await tool.release(instance_id)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
@@ -198,92 +311,18 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             len(tool_call.keys()) != 2:
                 return
 
-            # 1.4 目前只支持 'python' 工具
-            if tool_call.get('name') != 'python':
-                return
-
             if not isinstance(tool_call.get('arguments'), dict):
                 return
 
-            code = tool_call.get('arguments', {}).get('code')
-            if not code:
-                return
+            tool_name = tool_call.get('name')
+            arguments = tool_call.get('arguments', {})
 
-            # === 2. 执行代码并获取结果 ===
-            cells.append(code)
-            result = await self.sandbox_run_jupyter(cells)
-            if not result:
-                return
-
-            # === 3. 处理执行结果，构建 content (核心优化部分) ===
-            # 采用更清晰的 if/elif/else 结构，一次性构建好最终的 content
-            
-            content = []
-            
-            # 情况一：执行成功，有输出（stdout 或 display 数据）
-            if result.stdout or result.display:
-                texts = []
-                images = []
-                
-                if result.stdout:
-                    texts.append(result.stdout)
-                    
-                for item in result.display:
-                    try:
-                        if "image/png" in item:
-                            # 图像处理逻辑
-                            process = False
-                            if hasattr(self, "_need_process"):
-                                wh = Image.open(io.BytesIO(base64.b64decode(item['image/png']))).size
-                                if self._need_process(wh[0], wh[1]):
-                                    process = True
-                            else:
-                                process = True
-                            if process:
-                                image = base64_to_pil(item['image/png'])
-                                image = self._process_image(image)
-                                image_base64 = pil_to_base64(image)
-                                wh = Image.open(io.BytesIO(base64.b64decode(image_base64))).size
-                            else:
-                                image_base64 = item['image/png']
-                            
-                            images.append({
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{image_base64}",
-                                              "w": wh[0],
-                                              "h": wh[1]}
-                            })
-                            texts.append(self.image_tag)
-                        if 'text/plain' in item:
-                            texts.append(item['text/plain'])
-                    except Exception as e:
-                        # 如果单个 display item 处理失败，跳过它，而不是中断整个流程
-                        print(e)
-                        continue
-                
-                # 将收集到的文本和图片组装成最终的 content 格式
-                if texts:
-                    texts.insert(0, '<tool_response>')
-                    texts.append('</tool_response>')
-                    content.append({"type": "text", "text": '\n'.join(texts).strip()})
-                if images:
-                    content.extend(images)
-
-            # 情况二：执行出错
-            elif result.error and isinstance(result.error, list) and result.error:
-                try:
-                    trace = '\n'.join(result.error[0].get('traceback', []))
-                    # 移除 ANSI 颜色代码
-                    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-                    clean_trace = ansi_escape.sub('', trace)
-                    content = [{"type": "text", "text": clean_trace}]
-                except (TypeError, AttributeError):
-                    # 如果错误格式不规范，返回一个通用错误信息
-                    content = [{"type": "text", "text": "<tool_response>\n[An unknown error occurred during execution.]\n</tool_response>"}]
-            
-            # 情况三：执行成功，但没有任何输出
+            if tool_name == 'python':
+                content = await self.python_code_interpreter(cells, tool_name, arguments)
             else:
-                content = [{"type": "text", "text": "<tool_response>\n[Execution completed with no output.]\n</tool_response>"}]
+                content = await self.tool_call_execute(tool_name, arguments)
+
+            print(f"!!!! content: {content}")
 
             # === 4. 返回最终消息 ===
             if not content:
