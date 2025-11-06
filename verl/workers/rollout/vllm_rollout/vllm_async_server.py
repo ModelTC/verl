@@ -14,11 +14,16 @@
 import logging
 import os
 import pickle
+import cloudpickle
 from copy import deepcopy
 from typing import Any, Callable, Optional
+from PIL import Image
+
+from pydantic import BaseModel
 
 import ray
 import zmq
+import asyncio
 from omegaconf import DictConfig, OmegaConf
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
@@ -33,6 +38,8 @@ from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
+from verl.utils.dataset.image_processors import image_convert
+from verl.workers.rollout.async_server import TokenOutput
 
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
@@ -161,13 +168,13 @@ class ExternalZeroMQDistributedExecutor(Executor):
             sent_method = pickle.dumps(method)
         del method
 
-        message = pickle.dumps((sent_method, args, kwargs or {}))
+        message = cloudpickle.dumps((sent_method, args, kwargs or {}))
         for socket in self.sockets:
             socket.send(message, zmq.DONTWAIT)
 
         outputs = []
         for socket in self.sockets:
-            outputs.append(pickle.loads(socket.recv()))
+            outputs.append(cloudpickle.loads(socket.recv()))
         return outputs
 
     def check_health(self):
@@ -334,10 +341,27 @@ class AsyncvLLMServer(AsyncServerBase):
             assert isinstance(generator, ChatCompletionResponse)
             return JSONResponse(content=generator.model_dump())
 
-    async def generate(self, prompt_ids: list[int], sampling_params: dict[str, Any], request_id: str) -> list[int]:
+    async def generate(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ) -> TokenOutput:
+        """Generate sequence with token-in-token-out."""
+        # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_tokens = self.max_model_len - len(prompt_ids)
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        sampling_params.setdefault("repetition_penalty", self.config.rollout.get("repetition_penalty", 1.0))
+        if 'max_tokens' not in sampling_params:
+            sampling_params["max_tokens"] = max_tokens
+        sampling_params = SamplingParams(**sampling_params)
+
+        if image_data is not None and len(image_data) > 0:
+            image_data = [image_convert(image_item) for image_item in image_data]
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data})
+        else:
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
         generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
 
         # Get final response
@@ -346,7 +370,15 @@ class AsyncvLLMServer(AsyncServerBase):
             final_res = output
         assert final_res is not None
 
-        return final_res.outputs[0].token_ids
+        token_ids = final_res.outputs[0].token_ids
+        log_probs = None
+        if sampling_params.logprobs is not None:
+            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+
+        finish_reason = final_res.outputs[0].finish_reason
+        assert finish_reason is not None
+
+        return TokenOutput(token_ids=token_ids, log_probs=log_probs, finish_reason=finish_reason)
 
     async def wake_up(self):
         if self.config.rollout.free_cache_engine:
@@ -355,5 +387,10 @@ class AsyncvLLMServer(AsyncServerBase):
     async def sleep(self):
         # TODO: https://github.com/vllm-project/vllm/issues/17103
         await self.engine.reset_prefix_cache()
+        await self.engine.reset_mm_cache()
         if self.config.rollout.free_cache_engine:
             await self.engine.sleep()
+
+    async def abort(self):
+        tasks = [asyncio.create_task(self.engine.abort(request_id)) for request_id in self.engine.output_processor.request_states.keys()]
+        await asyncio.gather(*tasks)

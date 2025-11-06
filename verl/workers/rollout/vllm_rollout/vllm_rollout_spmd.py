@@ -29,6 +29,7 @@ When working with Megatron:
 import logging
 import os
 import pickle
+import cloudpickle
 import socket
 import threading
 from contextlib import contextmanager
@@ -479,9 +480,9 @@ class vLLMAsyncRollout:
     def _loop_forever(self):
         while True:
             message = self.socket.recv()
-            method, args, kwargs = pickle.loads(message)
+            method, args, kwargs = cloudpickle.loads(message)
             result = self.execute_method(method, *args, **kwargs)
-            self.socket.send(pickle.dumps(result))
+            self.socket.send(cloudpickle.dumps(result))
 
     def get_zeromq_address(self):
         return self.address

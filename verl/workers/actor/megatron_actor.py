@@ -64,6 +64,7 @@ class MegatronPPOActor(BasePPOActor):
         tf_config,
         actor_module: nn.ModuleList,
         actor_optimizer: DistributedOptimizer,
+        processor=None,
     ):
         """MeagtronPPOActor class. This class implements the simple PPO logics when the model is built with Megatron.
 
@@ -147,6 +148,8 @@ class MegatronPPOActor(BasePPOActor):
         config = get_model_config(self.actor_module[0])
         print(config)
         config.finalize_model_grads_func = finalize_model_grads
+
+        self.processor = processor
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -611,7 +614,7 @@ class MegatronPPOActor(BasePPOActor):
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
         # batch should be a list of batches inside micro-batches
-        batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module), hf_config=self.hf_config)
+        batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module), processor=self.processor)
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)

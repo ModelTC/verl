@@ -660,6 +660,25 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+
+        # pop those keys for generation
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # For agent loop, we need reward model keys to compute score.
+        if self.async_rollout_mode:
+            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
+
+
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -675,6 +694,11 @@ class RayPPOTrainer:
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+
             # repeat test batch
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
@@ -689,25 +713,14 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
-            sample_indices.extend(test_batch.non_tensor_batch['index'])
+            sample_indices.extend(test_batch.non_tensor_batch['uid'])
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "interaction_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-            if "agent_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("agent_name")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
-
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
+            
+            test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -728,10 +741,12 @@ class RayPPOTrainer:
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
-                # test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                self.async_rollout_manager.wake_up()
-                test_output_gen_batch_padded = self.chat_scheduler_wg.generate_sequences(test_gen_batch_padded)
-                self.async_rollout_manager.sleep()
+                if self.config.trainer.get("use_agent_loop", False):
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                else:
+                    self.async_rollout_manager.wake_up()
+                    test_output_gen_batch_padded = self.chat_scheduler_wg.generate_sequences(test_gen_batch_padded)
+                    self.async_rollout_manager.sleep()
 
                 if 'multi_modal_inputs' in test_output_gen_batch_padded.non_tensor_batch:
                     if 'multi_modal_inputs' in test_batch.non_tensor_batch:
@@ -931,41 +946,43 @@ class RayPPOTrainer:
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            # from verl.experimental.agent_loop import AgentLoopManager
 
-            # self.async_rollout_mode = True
-            # self.async_rollout_manager = AgentLoopManager(
-            #     config=self.config,
-            #     worker_group=self.actor_rollout_wg,
-            # )
+            if self.config.trainer.get("use_agent_loop", False):
+                from verl.experimental.agent_loop import AgentLoopManager
 
-            from verl.workers.rollout.async_server import AsyncLLMServerManager
-            self.async_rollout_mode = True
-            self.async_rollout_manager = AsyncLLMServerManager(
-                config=self.config,
-                worker_group=self.actor_rollout_wg,
-            )
+                self.async_rollout_mode = True
+                self.async_rollout_manager = AgentLoopManager(
+                    config=self.config,
+                    worker_group=self.actor_rollout_wg,
+                )
+            else:
+                from verl.workers.rollout.async_server import AsyncLLMServerManager
+                self.async_rollout_mode = True
+                self.async_rollout_manager = AsyncLLMServerManager(
+                    config=self.config,
+                    worker_group=self.actor_rollout_wg,
+                )
 
-            import importlib
-            chat_scheduler_num = self.config.actor_rollout_ref.rollout.chat_scheduler_num
-            server_addresses = self.async_rollout_manager.server_addresses 
-            assert self.config.data.train_batch_size % self.config.actor_rollout_ref.rollout.chat_scheduler_num == 0 
-            assert chat_scheduler_num % len(server_addresses) == 0 or len(server_addresses) % chat_scheduler_num == 0
+                import importlib
+                chat_scheduler_num = self.config.actor_rollout_ref.rollout.chat_scheduler_num
+                server_addresses = self.async_rollout_manager.server_addresses 
+                assert self.config.data.train_batch_size % self.config.actor_rollout_ref.rollout.chat_scheduler_num == 0 
+                assert chat_scheduler_num % len(server_addresses) == 0 or len(server_addresses) % chat_scheduler_num == 0
 
-            module_path, class_name = self.config.actor_rollout_ref.rollout.chat_scheduler.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            scheduler_cls = getattr(module, class_name)
-            resource_pool = RayResourcePool(
-                [chat_scheduler_num], use_gpu=False, max_colocate_count=1
-            )
-            cls_with_args = RayClassWithInitArgs(
-                cls=ray.remote(scheduler_cls), 
-                config=self.config.actor_rollout_ref.rollout,
-                model_path=self.config.actor_rollout_ref.model.path,
-                server_addresses=server_addresses,
-                **self.scheduler_kwargs
-            )
-            self.chat_scheduler_wg = RayWorkerGroup(resource_pool, cls_with_args)
+                module_path, class_name = self.config.actor_rollout_ref.rollout.chat_scheduler.rsplit(".", 1)
+                module = importlib.import_module(module_path)
+                scheduler_cls = getattr(module, class_name)
+                resource_pool = RayResourcePool(
+                    [chat_scheduler_num], use_gpu=False, max_colocate_count=1
+                )
+                cls_with_args = RayClassWithInitArgs(
+                    cls=ray.remote(scheduler_cls), 
+                    config=self.config.actor_rollout_ref.rollout,
+                    model_path=self.config.actor_rollout_ref.model.path,
+                    server_addresses=server_addresses,
+                    **self.scheduler_kwargs
+                )
+                self.chat_scheduler_wg = RayWorkerGroup(resource_pool, cls_with_args)
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1176,30 +1193,12 @@ class RayPPOTrainer:
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # pop those keys for generation
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                if "multi_modal_data" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                if "raw_prompt" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "max_turns" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("max_turns")
-                if "single_response_length" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("single_response_length")
-                if "tools_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "interaction_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-                if "index" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("index")
-                if "agent_name" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("agent_name")
+                # add uid to batch
+                batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
 
-                gen_batch = batch.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                )         
+                gen_batch = self._get_gen_batch(batch)
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)

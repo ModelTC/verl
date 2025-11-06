@@ -22,7 +22,7 @@ from verl import DataProto
 from .sequence_parallel import pad_to_sequence_parallel
 
 from PIL import Image
-from verl.utils.dataset.image_processors import bytes_to_pil, base64_to_pil, preprocess_images_internvl
+from verl.utils.dataset.image_processors import bytes_to_pil, base64_to_pil
 from functools import partial
 
 
@@ -53,7 +53,7 @@ def compute_transformers_input_shapes(batches, meta_info):
     return input_shapes
 
 
-def make_batch_generator(batches, vpp_size, hf_config=None):
+def make_batch_generator(batches, vpp_size, processor=None):
     """
     Creates a batch generator suitable for Megatron pipeline parallelism,
     handling virtual pipeline parallelism (VPP).
@@ -70,7 +70,7 @@ def make_batch_generator(batches, vpp_size, hf_config=None):
     """
 
     if 'multi_modal_data' in batches[0].keys():
-        batches = pixel_prefetch(batches, hf_config)
+        batches = PixelPrefetch(batches, processor)
 
 
     # batches = batches[:2]
@@ -85,28 +85,17 @@ def make_batch_generator(batches, vpp_size, hf_config=None):
 
 
 class PrefetchDataset(torch.utils.data.Dataset):
-    def __init__(self, batches, hf_config):
-        self.batches = batches
-        self.hf_config = hf_config
+    def __init__(self, multi_modal_data, multi_modal_inputs_idx, multi_modal_inputs, processor):
+        self.multi_modal_data = multi_modal_data
+        self.multi_modal_inputs_idx = multi_modal_inputs_idx
+        self.multi_modal_inputs = multi_modal_inputs
 
-        self.image_size = self.hf_config.force_image_size or self.hf_config.vision_config.image_size
-        patch_size = self.hf_config.vision_config.patch_size
-        downsample_ratio = self.hf_config.downsample_ratio
-        self.preprocess_images_fn = partial(
-            preprocess_images_internvl,
-            image_size=self.image_size, 
-            min_dynamic_patch=self.hf_config.min_dynamic_patch, 
-            max_dynamic_patch=self.hf_config.max_dynamic_patch, 
-            use_thumbnail=self.hf_config.use_thumbnail, 
-            num_image_token=int((self.image_size // patch_size)**2 * (downsample_ratio**2))
-        )
+        self.processor = processor
 
+    def __len__(self):
+        return len(self.multi_modal_inputs_idx)
 
-    def multi_modal_preprocess(self, data):
-        if 'multi_modal_data' not in data.keys():
-            return data
-
-
+    def __getitem__(self, index):
         def image_convert(image_item):
             if isinstance(image_item, Image.Image):
                 return image_item
@@ -117,44 +106,59 @@ class PrefetchDataset(torch.utils.data.Dataset):
             else:
                 raise ValueError(f"Unsupported image type: {type(image_item)}")
 
-        for item_idx in data['multi_modal_inputs_idx']:
-            if 'pixel_values' in data['multi_modal_inputs'][item_idx]:
+        outputs = {
+            'multi_modal_inputs_idx': self.multi_modal_inputs_idx[index],
+            'multi_modal_inputs': [{}] * len(self.multi_modal_inputs)
+        }
+        for item_idx in self.multi_modal_inputs_idx[index]:
+            if 'pixel_values' in self.multi_modal_inputs[item_idx]:
+                outputs['multi_modal_inputs'][item_idx] = copy.deepcopy(self.multi_modal_inputs[item_idx]) # NOTE: use deepcopy to avoid modifying the original data
                 continue
-            multi_modal_data = data['multi_modal_data'][item_idx]
+            multi_modal_data = self.multi_modal_data[item_idx]
             if 'image' in multi_modal_data:
                 images = [image_convert(image_item) for image_item in multi_modal_data['image']]
-                image_inputs, _ = self.preprocess_images_fn(images=images)
-                data['multi_modal_inputs'][item_idx] = image_inputs
+                multi_modal_inputs = self.processor.image_processor(images=images)
+                multi_modal_inputs = {
+                    'pixel_values': multi_modal_inputs['pixel_values_flat'],
+                    'image_flags': multi_modal_inputs['image_flags']
+                }
+                outputs['multi_modal_inputs'][item_idx] = multi_modal_inputs
+
+                print(multi_modal_inputs)
+                # breakpoint()
             else:
-                data['multi_modal_inputs'][item_idx] = {
+                outputs['multi_modal_inputs'][item_idx] = {
                     'pixel_values': torch.zeros(1, 3, self.image_size, self.image_size),
                     'image_flags': torch.zeros(1, dtype=torch.long)
                 }
 
-        data.pop('multi_modal_data')
-        return data
+        return outputs
 
 
-    def __len__(self):
-        return len(self.batches)
+class PixelPrefetch:
 
+    def __init__(self, batches, processor):
 
-    def __getitem__(self, index):
-        batch_item = copy.deepcopy(self.batches[index])
-        return self.multi_modal_preprocess(batch_item)
+        self.batches = batches
 
+        mutli_modal_data = [item.pop('multi_modal_data').data for item in self.batches][0] # NOTE: [0] has all multi_modal_data
+        multi_modal_inputs_idx = [item.pop('multi_modal_inputs_idx').data.to('cpu', non_blocking=False) for item in self.batches]
+        multi_modal_inputs = [item.pop('multi_modal_inputs').data for item in self.batches][0] # NOTE: [0] has all multi_modal_inputs
 
-def pixel_prefetch(batches, hf_config):
-    batches_cpu = [item.to("cpu", non_blocking=False) for item in batches]
-    dataset = PrefetchDataset(batches_cpu, hf_config)
+        self.dataset = PrefetchDataset(mutli_modal_data, multi_modal_inputs_idx, multi_modal_inputs, processor)
+        self.dataloader = torch.utils.data.DataLoader(
+            self.dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x[0],
+        )
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        collate_fn=lambda x: x[0],
-    )
+    def __iter__(self):
 
-    return dataloader
+        for batch_idx, batch_item in enumerate(self.dataloader):
+            self.batches[batch_idx]['multi_modal_inputs_idx'] = batch_item['multi_modal_inputs_idx']
+            self.batches[batch_idx]['multi_modal_inputs'] = batch_item['multi_modal_inputs']
+
+            yield self.batches[batch_idx]
