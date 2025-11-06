@@ -164,7 +164,14 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+        if config.trainer.use_refactor_rollout:
+            from verl.trainer.ppo.ray_trainer_v1 import RayPPOTrainerV1
+            from verl.trainer.ppo.ray_trainer_v1 import ResourcePoolManager, Role
+            trainer_cls = RayPPOTrainerV1
+        else:
+            from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+            from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+            trainer_cls = RayPPOTrainer
 
         # Map roles to their corresponding remote worker classes.
         role_worker_mapping = {
@@ -221,7 +228,7 @@ class TaskRunner:
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,

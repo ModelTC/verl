@@ -329,6 +329,12 @@ trainer:
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
 
+  # whether to use refactor rollout
+  use_refactor_rollout: False
+
+  # whether to use agent loop
+  use_agent_loop: False
+
 # configs related to ray initialization
 ray_init:
 

@@ -261,6 +261,9 @@ class RLHFJSONDataset(RLHFDataset):
                 ):
                     d['reward_model']['reward_fn'] = dataset_info['reward_fn']
 
+                if d['reward_model']['reward_fn'] == 'bbox_iou':
+                    d['reward_model']['reward_fn'] = 'grounding_iou_single'
+
                 assert 'reward_fn' in d['reward_model'], \
                     f"reward_model.reward_fn is not defined for {d['id']}"
 
@@ -325,8 +328,14 @@ class RLHFJSONDataset(RLHFDataset):
         preprocess_fn = self._internvl_preprocess if self.apply_internvl_preprocess else self._default_preprocess
         try:
             output_dict = preprocess_fn(row_dict)
-            output_dict['max_turns'] = row_dict['max_turns']
-            output_dict['single_response_length'] = row_dict['single_response_length']
+
+            if 'agent_name' in row_dict:
+                output_dict['agent_name'] = row_dict['agent_name']
+            if 'max_turns' in row_dict:
+                output_dict['max_turns'] = row_dict['max_turns']
+            if 'single_response_length' in row_dict:
+                output_dict['single_response_length'] = row_dict['single_response_length']
+
             return output_dict
         except Exception as e:
             print(f"Error: {e}\ndata id: {row_dict['id']}")
@@ -339,7 +348,7 @@ class RLHFJSONDataset(RLHFDataset):
             for segment in re.split("(<image>)", content):
                 if segment == "":
                     continue
-                elif segment == "<image>":
+                elif segment == "<image>": # TODO(yzx): no need to split <image>
                     image = images.pop(0)
                     wh = image.size
                     img_byte_arr = io.BytesIO()
@@ -383,27 +392,24 @@ class RLHFJSONDataset(RLHFDataset):
         if is_multi_modal: 
             # transform = build_transform(is_train=self.is_train, input_size=self.image_size, pad2square=self.pad2square)
             output_dict['multi_modal_data'] = {'image': [process_image(self.tcs_loader(image)) for image in row_dict.pop(self.image_key)]}
+            output_dict['multi_modal_data']['image_wh'] = [(image.size[0], image.size[1]) for image in output_dict['multi_modal_data']['image']]
 
             # convert image to patches
             num_image = len(output_dict['multi_modal_data']['image'])
-            images, num_tiles = [], []
-            for image in output_dict['multi_modal_data']['image']:
-                patches = dynamic_preprocess_v4(
-                    image, 
-                    min_num=self.min_dynamic_patch, 
-                    max_num=max(self.max_dynamic_patch // num_image, 1),
-                    image_size=self.image_size, 
-                    use_thumbnail=self.use_thumbnail)
-                images.extend(patches)
-                num_tiles.append(len(patches))
-            # pixel_values = [transform(image) for image in images]
-            pixel_values = torch.stack(images)
-            num_patches = pixel_values.size(0)
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
-            assert sum(num_tiles) == pixel_values.size(0), f"{sum(num_tiles)=}, {pixel_values.size(0)=}"
+            image_inputs = self.processor.image_processor(
+                output_dict['multi_modal_data']['image'],
+                min_num=self.min_dynamic_patch, 
+                max_num=max(self.max_dynamic_patch // num_image, 1),
+                image_size=self.image_size, 
+                use_thumbnail=self.use_thumbnail
+            )
+            num_patches = image_inputs['image_num_patches']
+            pixel_values = image_inputs['pixel_values_flat']
+            image_flags = image_inputs['image_flags']
+            assert sum(num_patches) == pixel_values.size(0), f"{sum(num_patches)=}, {pixel_values.size(0)=}"
 
             # replace <image> with image tokens
-            num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
+            num_image_tokens = [self.num_image_token * num_patch for num_patch in num_patches]
             assert len(num_image_tokens) == prompt_with_chat_template.count('<image>'), f"{len(num_image_tokens)=}, {prompt_with_chat_template.count('<image>')=}"
             for i in range(len(num_image_tokens)):
                 prompt_with_chat_template = prompt_with_chat_template.replace('<image>', f"{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_tokens[i]}{IMG_END_TOKEN}", 1)
@@ -414,7 +420,7 @@ class RLHFJSONDataset(RLHFDataset):
                 'image_flags': image_flags
             }
         else:
-            output_dict['multi_modal_data'] = {'image': []}
+            output_dict['multi_modal_data'] = {'image': [], 'image_wh': []}
             output_dict['multi_modal_inputs'] = {
                 'pixel_values': torch.zeros(1, 3, self.image_size, self.image_size),
                 'image_flags': torch.zeros(1, dtype=torch.long)

@@ -113,7 +113,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
                 pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
                 virtual_pipeline_model_parallel_size=self.config.actor.megatron.virtual_pipeline_model_parallel_size,
-                pipeline_model_parallel_split_rank=None,
                 use_sharp=False,
                 context_parallel_size=self.config.actor.megatron.context_parallel_size,
                 expert_model_parallel_size=self.config.actor.megatron.expert_model_parallel_size,
@@ -463,6 +462,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 tf_config=self.tf_config,
                 actor_module=self.actor_module,
                 actor_optimizer=self.actor_optimizer,
+                processor=self.processor,
             )
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
@@ -489,6 +489,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 tf_config=self.tf_config,
                 actor_module=self.ref_module,
                 actor_optimizer=None,
+                processor=self.processor,
             )
             if self._ref_is_offload_param:
                 offload_megatron_model_to_cpu(self.ref_module)
@@ -771,7 +772,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
                 tensor_model_parallel_size=self.config.megatron.tensor_model_parallel_size,
                 pipeline_model_parallel_size=self.config.megatron.pipeline_model_parallel_size,
                 virtual_pipeline_model_parallel_size=self.config.megatron.virtual_pipeline_model_parallel_size,
-                pipeline_model_parallel_split_rank=None,
                 use_sharp=False,
                 context_parallel_size=self.config.megatron.context_parallel_size,
                 expert_model_parallel_size=self.config.megatron.expert_model_parallel_size,
@@ -1051,7 +1051,6 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
                 tensor_model_parallel_size=self.config.megatron.tensor_model_parallel_size,
                 pipeline_model_parallel_size=self.config.megatron.pipeline_model_parallel_size,
                 virtual_pipeline_model_parallel_size=self.config.megatron.virtual_pipeline_model_parallel_size,
-                pipeline_model_parallel_split_rank=None,
                 use_sharp=False,
                 context_parallel_size=self.config.megatron.context_parallel_size,
                 expert_model_parallel_size=self.config.megatron.expert_model_parallel_size,

@@ -1,0 +1,29 @@
+{
+  "auto_map": {
+    "AutoProcessor": "processing_internvl.InternVLProcessor",
+    "AutoImageProcessor": "processing_internvl.InternVLImageProcessor"
+  },
+  "processor_class": "InternVLProcessor",
+  "min_dynamic_patch": 1,
+  "max_dynamic_patch": 12,
+  "image_size": 448,
+  "patch_size": 14,
+  "use_thumbnail": true,
+  "downsample_ratio": 0.5,
+  "num_image_token": 256,
+  "image_mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "image_std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "do_resize": true,
+  "do_normalize": true,
+  "do_convert_rgb": true,
+  "resample": "bicubic"
+}
+

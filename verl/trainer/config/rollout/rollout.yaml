@@ -166,6 +166,9 @@ multi_turn:
   # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
   format: hermes
 
+  # Whether to terminate the rollout if a tool execution error occurs.
+  terminate_on_tool_error: False
+
 # support logging rollout prob for debugging purpose
 calculate_log_probs: False
 
@@ -174,6 +177,9 @@ agent:
 
   # Number of agent loop workers
   num_workers: 8
+
+  # default agent loop to use if `agent_name` not set in RL dataset
+  default_agent_loop: single_turn_agent
 
   # custom agent loop config path, which should contain list of configs to intialize AgentLoop instances.
   # https://hydra.cc/docs/advanced/instantiate_objects/overview/
@@ -218,3 +224,12 @@ trace:
 
   # whether translate token id to text in output
   token2text: False
+
+partial_rollout:
+  enable: False
+
+continuous_dispatch: False
+
+reward_fn_timeout: 120
+
+sample_filter_fn: null

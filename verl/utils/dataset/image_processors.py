@@ -271,3 +271,12 @@ def pil_to_base64(image):
     image.save(buffered, format="PNG")  # You can change the format if needed, e.g., "JPEG"
     image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
     return image_base64
+
+
+def image_convert(image_item):
+    if isinstance(image_item, Image.Image):
+        return image_item
+    elif isinstance(image_item, bytes):
+        return bytes_to_pil(image_item)
+    else:
+        raise ValueError(f"Unsupported image type: {type(image_item)}")

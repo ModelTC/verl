@@ -26,12 +26,23 @@ import uvicorn
 from omegaconf import DictConfig
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from pydantic import BaseModel
 
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.workers.rollout.chat_scheduler import ChatCompletionScheduler
 
 logger = logging.getLogger(__file__)
+
+
+class TokenOutput(BaseModel):
+    #NOTE: copy from from verl.workers.rollout.replica
+    token_ids: list[int]
+    """response token ids"""
+    log_probs: Optional[list[float]] = None
+    """logprobs of response token ids"""
+    finish_reason: Optional[str] = None
+    """ finish_reason of response"""
 
 
 def _get_free_port():

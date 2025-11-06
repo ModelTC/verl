@@ -1,0 +1,15 @@
+{
+  "auto_map": {
+    "AutoProcessor": "processing_internvl.InternVLProcessor",
+    "AutoImageProcessor": "processing_internvl.InternVLImageProcessor"
+  },
+  "processor_class": "InternVLProcessor",
+  "image_size": 448,
+  "patch_size": 14,
+  "min_dynamic_patch": 1,
+  "max_dynamic_patch": 12,
+  "use_thumbnail": true,
+  "downsample_ratio": 0.5,
+  "image_token": "<img></img>"
+}
+

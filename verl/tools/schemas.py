@@ -15,7 +15,7 @@
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 
 class OpenAIFunctionPropertySchema(BaseModel):
@@ -23,7 +23,7 @@ class OpenAIFunctionPropertySchema(BaseModel):
 
     type: str
     description: str | None = None
-    enum: list[str] | None = None
+    enum: list[Any] | None = None
 
 
 class OpenAIFunctionParametersSchema(BaseModel):
@@ -87,3 +87,41 @@ class OpenAIFunctionToolCall(BaseModel):
     id: str
     type: Literal["function"] = "function"
     function: OpenAIFunctionCallSchema
+
+
+class ToolResponse(BaseModel):
+    """The response from a tool execution."""
+
+    text: str | None = None
+    image: list[Any] | None = None
+    video: list[Any] | None = None
+    audio: list[Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def initialize_request(cls, values):
+        if "image" in values and not isinstance(values["image"], list):
+            raise ValueError(
+                f"Image must be a list, but got {type(values['image'])}. Please check the tool.execute(). "
+                f"For single images, wrap in a list: [image]. "
+                f"Example: {{'image': [img1]}} or {{'image': [img1, img2, ...]}}."
+            )
+        if "video" in values and not isinstance(values["video"], list):
+            raise ValueError(
+                f"Video must be a list, but got {type(values['video'])}. Please check the tool.execute(). "
+                f"For single videos, wrap in a list: [video]. "
+                f"Example: {{'video': [video1]}} or {{'video': [video1, video2, ...]}}."
+            )
+        if "audio" in values and not isinstance(values["audio"], list):
+            raise ValueError(
+                f"Audio must be a list, but got {type(values['audio'])}. Please check the tool.execute(). "
+                f"For single audio, wrap in a list: [audio]. "
+                f"Example: {{'audio': [audio1]}} or {{'audio': [audio1, audio2, ...]}}."
+            )
+        return values
+
+    def is_empty(self) -> bool:
+        return not self.text and not self.image and not self.video and not self.audio
+
+    def is_text_only(self) -> bool:
+        return self.text and not self.image and not self.video and not self.audio

@@ -90,3 +90,9 @@ class BaseTool:
             instance_id: The instance id of the tool.
         """
         pass
+
+    async def reset_cache(self, instance_id: str):
+        pass
+
+    async def append_cache(self, instance_id: str, parameters: dict[str, Any]):
+        pass

@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
@@ -219,12 +220,16 @@ class InternBaseTransformerLayer(TransformerLayer):
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             hidden_dropout=hidden_dropout,
+            model_comm_pgs=model_comm_pgs,
+            vp_stage=vp_stage,
         )
         
         self.ls1 = nn.Parameter(self.config.initializer_factor * torch.ones(self.config.hidden_size))
