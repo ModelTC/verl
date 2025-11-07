@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Optional
 import json
 from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -12,6 +13,7 @@ import re
 import io
 from omegaconf import DictConfig, ListConfig
 from typing import List, Optional, Union
+import numpy as np
 
 import base64
 
@@ -223,9 +225,9 @@ class RLHFJSONDataset(RLHFDataset):
         else:
             raise Exception(f"filename({filename}) not contain 'train' or 'test'")
 
-        super().__init__(data_files, tokenizer, config, processor)
-        
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
+        
+        super().__init__(data_files, tokenizer, config, processor)
 
 
     def _read_files_and_tokenize(self):
@@ -274,52 +276,75 @@ class RLHFJSONDataset(RLHFDataset):
 
         print(f'dataset len: {len(self.dataframe)}')
         
-        # self.dataframe = datasets.Dataset.from_list(self.dataframe)
-        self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+        length_cache_dir = self.config.get('length_cache_dir', 'length_cache')
+        os.makedirs(length_cache_dir, exist_ok=True)
+        length_cache_file = f'{length_cache_dir}/{self.meta_file.split("/")[-1]}.npy'
+        if os.path.exists(length_cache_file):
+            print(f"load length cache from {length_cache_file}")
+            self.length = np.load(length_cache_file, allow_pickle=True).item()
+
+            if len(self.length) != len(self.dataframe):
+                print(f"length cache has {len(self.length)} items, but dataframe has {len(self.dataframe)} items, re-calculate length cache")
+                self.length = {}
+        else:
+            print(f"no length cache found, create new length cache")
+            self.length = {}
+
+        if self.filter_overlong_prompts:
+            self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+
+        np.save(length_cache_file, self.length, allow_pickle=True)
         
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
-        if self.filter_overlong_prompts:
-            tokenizer = self.tokenizer
-            processor = self.processor
-            prompt_key = self.prompt_key
-            image_key = self.image_key
-            video_key = self.video_key
+    
+        def row_dict2len(row_dict) -> int:
+            chat = row_dict.get(self.prompt_key)
+            format_prompt_fn = format_prompt_fns[row_dict['input_template']['name']]
+            input_template_kwargs = row_dict['input_template'].get('arguments', {})
+            prompt_with_chat_template = format_prompt_fn(self.tokenizer, chat, row_dict.get(self.image_key, None), **input_template_kwargs) # will change chat inplace
+            raw_prompt = prompt_with_chat_template
+            raw_prompt = raw_prompt.replace('<image>', '<img></img>')
 
-            if processor is not None:
-                from verl.utils.dataset.vision_utils import process_image, process_video
+            is_multi_modal = self.image_key in row_dict and "<image>" in prompt_with_chat_template
+            if is_multi_modal: 
+                # transform = build_transform(is_train=self.is_train, input_size=self.image_size, pad2square=self.pad2square)
+                images = [process_image(self.tcs_loader(image)) for image in row_dict.get(self.image_key)]
+                image_whs = [(image.size[0], image.size[1]) for image in images]
+                
+                raw_prompt = self.processor.insert_media_placeholders_from_image_wh(raw_prompt, image_whs)
+            
+            input_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+            return len(input_ids)
 
-                def doc2len(doc) -> int:
-                    messages = self._build_messages(doc)
-                    raw_prompt = self.processor.apply_chat_template(
-                        messages, add_generation_prompt=True, tokenize=False
-                    )
-                    images = [process_image(image) for image in doc[image_key]] if image_key in doc else None
-                    videos = [process_video(video) for video in doc[video_key]] if video_key in doc else None
+        def _keep(doc, max_prompt_length):
+            item_id = doc['id']
+            try:
+                if item_id in self.length:
+                    doc_len = self.length[item_id]
+                else:
+                    doc_len = row_dict2len(doc)
+                    self.length[item_id] = doc_len
+            except Exception as e:
+                self.length[item_id] = 1e8 # 1e8 is a large number, so the doc will be filtered out
+                print(f"Error: {e}\ndata id: {item_id}")
+                return None
+            return doc if doc_len <= max_prompt_length else None
 
-                    return len(processor(text=[raw_prompt], images=images, videos=videos)["input_ids"][0])
+        from functools import partial
+        from concurrent.futures import ThreadPoolExecutor
+        keep_fn = partial(_keep, max_prompt_length=self.max_prompt_length)
 
-            else:
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            # map 保持顺序，filter 去掉 None
+            filter_dataframe = list(
+                filter(None, pool.map(keep_fn, dataframe))   # dataframe 是 list[dict]
+            )
+        end_time = time.time()
 
-                def doc2len(doc) -> int:
-                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+        print(f"filter dataset len: {len(filter_dataframe)}, time: {end_time - start_time}s")
 
-            def _keep(doc, doc2len, max_prompt_length):
-                return doc if doc2len(doc) <= max_prompt_length else None
-
-            from functools import partial
-            from concurrent.futures import ThreadPoolExecutor
-            keep_fn = partial(_keep, doc2len=doc2len, max_prompt_length=self.max_prompt_length)
-
-            with ThreadPoolExecutor() as pool:
-                # map 保持顺序，filter 去掉 None
-                filter_dataframe = list(
-                    filter(None, pool.map(keep_fn, dataframe))   # dataframe 是 list[dict]
-                )
-
-            print(f"filter dataset len: {len(filter_dataframe)}")
-        else:
-            filter_dataframe = dataframe
         return filter_dataframe
 
     def __getitem__(self, item):
@@ -382,7 +407,7 @@ class RLHFJSONDataset(RLHFDataset):
         output_dict = {}
         output_dict['reward_model'] = row_dict['reward_model']
         output_dict['data_source'] = row_dict['data_source']
-        chat = row_dict.pop(self.prompt_key)
+        chat = row_dict.get(self.prompt_key)
 
         format_prompt_fn = format_prompt_fns[row_dict['input_template']['name']]
         input_template_kwargs = row_dict['input_template'].get('arguments', {})
@@ -393,7 +418,7 @@ class RLHFJSONDataset(RLHFDataset):
         is_multi_modal = self.image_key in row_dict and "<image>" in prompt_with_chat_template
         if is_multi_modal: 
             # transform = build_transform(is_train=self.is_train, input_size=self.image_size, pad2square=self.pad2square)
-            output_dict['multi_modal_data'] = {'image': [process_image(self.tcs_loader(image)) for image in row_dict.pop(self.image_key)]}
+            output_dict['multi_modal_data'] = {'image': [process_image(self.tcs_loader(image)) for image in row_dict.get(self.image_key)]}
             output_dict['multi_modal_data']['image_wh'] = [(image.size[0], image.size[1]) for image in output_dict['multi_modal_data']['image']]
 
             # convert image to patches
@@ -471,7 +496,7 @@ class RLHFJSONDataset(RLHFDataset):
         output_dict['reward_model'] = row_dict['reward_model']
         output_dict['data_source'] = row_dict['data_source']
 
-        chat = row_dict.pop(self.prompt_key)
+        chat = row_dict.get(self.prompt_key)
         images = row_dict.get(self.image_key, None)
 
         format_prompt_fn = format_prompt_fns[row_dict['input_template']['name']]
@@ -482,7 +507,7 @@ class RLHFJSONDataset(RLHFDataset):
         is_multi_modal = self.image_key in row_dict and "<image>" in prompt_with_chat_template
         if is_multi_modal:  # expand image token
             raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            output_dict['multi_modal_data'] = {'image': [process_image(self.tcs_loader(image)) for image in row_dict.pop(self.image_key)]}
+            output_dict['multi_modal_data'] = {'image': [process_image(self.tcs_loader(image)) for image in row_dict.get(self.image_key)]}
             image_inputs = self.processor.image_processor(output_dict['multi_modal_data']['image'], return_tensors='pt')
             image_grid_thw = image_inputs['image_grid_thw']
             output_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
