@@ -315,6 +315,8 @@ class RLHFJSONDataset(RLHFDataset):
                 )
 
             print(f"filter dataset len: {len(filter_dataframe)}")
+        else:
+            filter_dataframe = dataframe
         return filter_dataframe
 
     def __getitem__(self, item):

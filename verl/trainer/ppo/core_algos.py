@@ -732,19 +732,16 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     return loss
 
 
-def compute_policy_loss(
-    old_log_prob,
-    log_prob,
-    advantages,
-    response_mask,
-    cliprange=None,
-    cliprange_low=None,
-    cliprange_high=None,
-    clip_ratio_c=3.0,
+@register_policy_loss("vanilla")  # type: ignore[arg-type]
+def compute_policy_loss_vanilla(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
-    rollout_log_probs: Optional[torch.Tensor] = None,
-):
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
 
@@ -760,16 +757,6 @@ def compute_policy_loss(
             Advantage estimates for each action, shape (batch_size, response_length).
         response_mask (torch.Tensor):
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
-        cliprange (float, optional):
-            Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
-            Defaults to None (must be provided).
-        cliprange_low (float, optional):
-            Lower clip range for dual-clip PPO. Defaults to same as `cliprange`.
-        cliprange_high (float, optional):
-            Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
-        clip_ratio_c (float, optional):
-            Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
-            Defaults to 3.0.
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
         config: `(verl.trainer.config.ActorConfig)`:
@@ -777,6 +764,20 @@ def compute_policy_loss(
         rollout_log_probs: `(torch.Tensor)`:
             log probabilities of actions under the rollout policy, shape (batch_size, response_length).
     """
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+        "clip_ratio_c", 3.0
+    )
+
+    cliprange = clip_ratio
+    cliprange_low = clip_ratio_low
+    cliprange_high = clip_ratio_high
+
     assert clip_ratio_c > 1.0, (
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
         + f" but get the value: {clip_ratio_c}."
@@ -809,107 +810,13 @@ def compute_policy_loss(
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
-    if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
-        # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
-        tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
-        if config.get('IcePop', None) is not None:         # Apply IcePop in Ring-mini-2.0
-            alpha = config.IcePop.get("alpha", 0.8)
-            beta = config.IcePop.get("beta", 1.2)
-            mask = (tis_imp_ratio >= alpha) & (tis_imp_ratio <= beta)
-            tis_imp_ratio *= mask
-        else:
-            tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
-        pg_losses = pg_losses * tis_imp_ratio
-        tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
+    # Apply rollout importance sampling weights if provided
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-    if config.tis_imp_ratio_cap > 0:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean
-    else:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
-
-
-
-@register_policy_loss("gspo")
-def compute_policy_loss_gspo(
-    old_log_prob: torch.Tensor,
-    log_prob: torch.Tensor,
-    advantages: torch.Tensor,
-    response_mask: torch.Tensor,
-    loss_agg_mode: str = "seq-mean-token-mean",
-    config: Optional[DictConfig | AlgoConfig] = None,
-    rollout_log_probs: Optional[torch.Tensor] = None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute the clipped policy objective and related metrics for GSPO.
-
-    See https://arxiv.org/pdf/2507.18071 for more details.
-
-    Args:
-        old_log_prob (torch.Tensor):
-            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
-        log_prob (torch.Tensor):
-            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
-        advantages (torch.Tensor):
-            Advantage estimates for each action, shape (batch_size, response_length).
-        response_mask (torch.Tensor):
-            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
-        loss_agg_mode (str, optional):
-            Aggregation mode for `agg_loss`. For GSPO, it is recommended to use "seq-mean-token-mean".
-    """
-
-    assert config is not None
-    assert isinstance(config, AlgoConfig)
-    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
-    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
-
-    negative_approx_kl = log_prob - old_log_prob
-
-    # compute sequence-level importance ratio:
-    # si(θ) = (π_θ(yi|x)/π_θold(yi|x))^(1/|yi|) =
-    # exp [(1/|y_i|) * Σ_t log(π_θ(y_i,t|x,y_i,<t)/π_θold(y_i,t|x,y_i,<t))]
-    seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
-    log_seq_importance_ratio = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
-
-    # Combined ratio at token level:
-    # s_i,t(θ) = sg[s_i(θ)] · π_θ(y_i,t|x, y_i,<t) / sg[π_θ(y_i,t|x, y_i,<t)]
-    # In log space: log(s_i,t(θ)) = sg[log(s_i(θ))] + log_prob - sg[log_prob]
-    # log_seq_importance_ratio = log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
-    log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
-
-    # finaly exp() to remove log
-    seq_importance_ratio = torch.exp(log_seq_importance_ratio)
-
-    pg_losses1 = -advantages * seq_importance_ratio
-    pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
-    pg_losses = torch.maximum(pg_losses1, pg_losses2)
-
-    if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
-        # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
-        tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
-        if config.get('IcePop', None) is not None:         # Apply IcePop in Ring-mini-2.0
-            alpha = config.IcePop.get("alpha", 0.8)
-            beta = config.IcePop.get("beta", 1.2)
-            mask = (tis_imp_ratio >= alpha) & (tis_imp_ratio <= beta)
-            tis_imp_ratio *= mask
-        else:
-            tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
-        pg_losses = pg_losses * tis_imp_ratio
-        tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
-
-    # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
-
-    # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
-
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-
-    if config.tis_imp_ratio_cap > 0:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean
-    else:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 @register_policy_loss("gspo_token")
@@ -920,7 +827,7 @@ def compute_policy_loss_gspo(
     response_mask: torch.Tensor,
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
-    rollout_log_probs: Optional[torch.Tensor] = None,
+    rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -965,22 +872,10 @@ def compute_policy_loss_gspo(
     pg_losses1 = -advantages * seq_importance_ratio
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
-    
-    if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
-        # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
-        tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
-        if config.get('IcePop', None) is not None:         # Apply IcePop in Ring-mini-2.0
-            alpha = config.IcePop.get("alpha", 0.8)
-            beta = config.IcePop.get("beta", 1.2)
-            mask = (tis_imp_ratio >= alpha) & (tis_imp_ratio <= beta)
-            tis_imp_ratio *= mask
-            tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask * mask)
-        else:
-            tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
-            tis_imp_ratio_mean = verl_F.masked_mean(tis_imp_ratio, response_mask)
-        pg_losses = pg_losses * tis_imp_ratio
 
-
+    # Apply rollout importance sampling weights if provided
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
 
@@ -990,11 +885,7 @@ def compute_policy_loss_gspo(
 
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     
-    if config.tis_imp_ratio_cap > 0:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean
-    else:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
-
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 @register_policy_loss("gpg")
