@@ -323,7 +323,7 @@ class RLHFJSONDataset(RLHFDataset):
                 if item_id in self.length:
                     doc_len = self.length[item_id]
                 else:
-                    doc_len = row_dict2len(doc)
+                    doc_len = row_dict2len(copy.deepcopy(doc))
                     self.length[item_id] = doc_len
             except Exception as e:
                 self.length[item_id] = 1e8 # 1e8 is a large number, so the doc will be filtered out
