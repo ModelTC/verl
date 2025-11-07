@@ -85,3 +85,13 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    # Rollout Importance Sampling (replaces legacy tis_imp_ratio_cap)
+    # Controls computation of IS weights and mismatch metrics
+    rollout_is_threshold: Optional[float] = None  # null = disabled, float = enabled
+    rollout_is_threshold_lower: Optional[float] = None
+    rollout_is_level: str = "token"
+    rollout_is_mode: str = "truncate"
+    rollout_is_veto_threshold: Optional[float] = 1e-4
+    # Controls whether to apply IS weights to policy loss (only if rollout_is_threshold is set)
+    # True = apply weights to loss, False = compute metrics only (no weight application)
+    rollout_is: bool = False
