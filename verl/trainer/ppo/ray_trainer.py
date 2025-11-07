@@ -1256,12 +1256,14 @@ class RayPPOTrainer:
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
-                            # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                            with marked_timer("wake_up", timing_raw):
-                                self.async_rollout_manager.wake_up()
-                            gen_batch_output = self.chat_scheduler_wg.generate_sequences(gen_batch)
-                            with marked_timer("sleep", timing_raw):
-                                self.async_rollout_manager.sleep()
+                            if self.config.trainer.get("use_agent_loop", False):
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            else:
+                                with marked_timer("wake_up", timing_raw):
+                                    self.async_rollout_manager.wake_up()
+                                gen_batch_output = self.chat_scheduler_wg.generate_sequences(gen_batch)
+                                with marked_timer("sleep", timing_raw):
+                                    self.async_rollout_manager.sleep()
 
                             if "multi_modal_inputs" in gen_batch_output.non_tensor_batch.keys():
                                 if "multi_modal_inputs" in batch.non_tensor_batch.keys():

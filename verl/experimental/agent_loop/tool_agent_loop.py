@@ -22,6 +22,7 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
+from verl.experimental.agent_loop.utils import merge_messages
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
@@ -120,6 +121,8 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        messages = merge_messages(messages)
+
         multi_modal_data = copy.deepcopy(kwargs.get("multi_modal_data", {}))
         metrics = {}
         request_id = uuid4().hex

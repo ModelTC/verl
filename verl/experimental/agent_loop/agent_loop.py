@@ -109,11 +109,21 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
         server = self._choose_server(request_id)
+
+        # NOTE(yzx): mutli_modal_data is not supported for now
+        # output = await server.generate.remote(
+        #     request_id=request_id,
+        #     prompt_ids=prompt_ids,
+        #     sampling_params=sampling_params,
+        #     multi_modal_data=multi_modal_data,
+        # )
+
+        image_data = multi_modal_data.get("image", None)
         output = await server.generate.remote(
             request_id=request_id,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
-            multi_modal_data=multi_modal_data,
+            image_data=image_data,
         )
         return output
 

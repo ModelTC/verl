@@ -18,6 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.utils import merge_messages
 from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)
@@ -37,6 +38,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        messages = merge_messages(messages)
         multi_modal_data = copy.deepcopy(kwargs.get("multi_modal_data", {}))
 
         metrics = {}
