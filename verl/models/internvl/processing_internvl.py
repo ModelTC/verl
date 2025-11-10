@@ -13,30 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
+import math
 from typing import Optional, Union
 
-import io
-import os
-import sys
-import random
-import re
-import json
-import math
-import copy
-from typing import Dict, List
-from typing import Optional, Union, List, Tuple, Dict
-
-
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-import transformers
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-
-import torch
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
@@ -320,7 +304,7 @@ class InternVLProcessor(ProcessorMixin):
 
     attributes = ["image_processor", "tokenizer"]
     tokenizer_class = "AutoTokenizer"
-    image_processor_class = "InternVLImageProcessor"
+    image_processor_class = "AutoImageProcessor"
 
     def __init__(
         self,
@@ -558,14 +542,5 @@ class InternVLProcessor(ProcessorMixin):
         image_processor_input_names = self.image_processor.model_input_names
         return tokenizer_input_names + image_processor_input_names
 
-
-from transformers import AutoProcessor
-from transformers import AutoImageProcessor
-
-from .configuration_internvl_chat import InternVLChatConfig
-
-config_class = InternVLChatConfig
-AutoProcessor.register(config_class, InternVLProcessor)
-AutoImageProcessor.register(config_class, InternVLImageProcessor)
 
 __all__ = ["InternVLProcessor"]
