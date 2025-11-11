@@ -194,6 +194,7 @@ class Sample:
     def from_dataset(cls, data: dict[str, Any], config: DictConfig) -> "Sample":
         index = data['index'][0]
         prompt_ids = data['raw_prompt_ids'].astype(int).squeeze().tolist()
+        prompt_ids = prompt_ids[:config.data.max_prompt_length]
         data_source = data['data_source'][0]
         reward_info = data['reward_model'][0]
         agent_name = data.get('agent_name', [None])[0] or config.actor_rollout_ref.rollout.agent.default_agent_loop
