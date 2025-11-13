@@ -125,7 +125,7 @@ class PrefetchDataset(torch.utils.data.Dataset):
                 outputs['multi_modal_inputs'][item_idx] = multi_modal_inputs
             else:
                 outputs['multi_modal_inputs'][item_idx] = {
-                    'pixel_values': torch.zeros(1, 3, self.image_size, self.image_size),
+                    'pixel_values': torch.zeros(1, 3, self.processor.image_size, self.processor.image_size),
                     'image_flags': torch.zeros(1, dtype=torch.long)
                 }
 

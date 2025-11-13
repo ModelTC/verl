@@ -218,6 +218,8 @@ class Sample:
 
         if 'multi_modal_data' in data:
             multi_modal_data = data.get('multi_modal_data')[0]
+        else:
+            multi_modal_data = None
 
         return cls(
             index=index,
