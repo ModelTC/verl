@@ -288,13 +288,21 @@ class vLLMRollout(BaseRollout):
                 else:
                     raise ValueError(f"Unsupported image type: {type(image_item)}")
 
-            image_list = []
+            multi_modal_data_list = []
             for multi_modal_data in non_tensor_batch["multi_modal_data"]:
-                image = multi_modal_data['image']
-                image_list.append({"image": [image_convert(image_item) for image_item in image]})
+                multi_modal_data_item = {}
+                if 'image' in multi_modal_data and len(multi_modal_data['image']) > 0:
+                    multi_modal_data_item['image'] = [image_convert(image_item) for image_item in multi_modal_data['image']]
+                if 'audio' in multi_modal_data and len(multi_modal_data['audio']) > 0:
+                    multi_modal_data_item['audio'] = multi_modal_data['audio']
 
-            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), image_list, strict=True):
-                if len(multi_modal_data['image']) == 0:
+                if len(multi_modal_data_item.keys()) == 0:
+                    multi_modal_data_item = None
+
+                multi_modal_data_list.append(multi_modal_data_item)
+
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), multi_modal_data_list, strict=True):
+                if multi_modal_data is None:
                     vllm_inputs.append({"prompt_token_ids": raw_prompt_ids})
                 else:
                     vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})

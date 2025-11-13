@@ -300,6 +300,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
             )
 
+            if hasattr(actor_module, "freeze"):
+                actor_module.freeze(self.config.model)
+
             for key, value in self.config.model.get('custom_kwargs', {}).items():
                 setattr(actor_module, key, value)
 

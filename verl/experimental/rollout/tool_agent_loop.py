@@ -43,13 +43,14 @@ class AgentData:
     """Encapsulates all state variables for the agent loop."""
 
     def __init__(self):
-        self.image_data = None
+        self.multi_modal_data = None
         self.metrics = {}
         self.request_id = None
         self.tools_kwargs = {}
 
         # State variables
         self.prompt_ids: list[int] = []
+        self.raw_prompt_ids: list[int] = []
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.response_logprobs: list[float] = []
@@ -139,7 +140,7 @@ class ToolAgentLoop(AgentLoopBase):
         sample.rollout_log_probs = agent_data.response_logprobs[:self.max_response_length] if agent_data.response_logprobs else None
         sample.user_turns = agent_data.user_turns
         sample.assistant_turns = agent_data.assistant_turns
-        sample.multi_modal_data = {"image": agent_data.image_data} if agent_data.image_data else None
+        sample.multi_modal_data = agent_data.multi_modal_data
         sample.metrics = agent_data.metrics
         sample.num_turns = agent_data.user_turns + agent_data.assistant_turns + 1
         sample.aborted_response_length = len(agent_data.aborted_response_ids)
@@ -161,7 +162,7 @@ class ToolAgentLoop(AgentLoopBase):
         # agent_data.response_ids = sample.response_ids.copy()
         agent_data.response_mask = sample.response_mask.copy()
         agent_data.response_logprobs = sample.rollout_log_probs.copy() if sample.rollout_log_probs else []
-        agent_data.image_data = sample.multi_modal_data.get("image", None) if sample.multi_modal_data else None
+        agent_data.multi_modal_data = sample.multi_modal_data
         agent_data.user_turns = sample.user_turns
         agent_data.assistant_turns = sample.assistant_turns
 
@@ -186,8 +187,8 @@ class ToolAgentLoop(AgentLoopBase):
         self, agent_data: AgentData, sampling_params: dict[str, Any]
     ) -> AgentState:
         with simple_timer("generate_sequences", agent_data.metrics):
-            if agent_data.image_data:
-                # NOTE: for vllm only, since vllm will replicate the image placeholder token by image_data.
+            if agent_data.multi_modal_data:
+                # NOTE: for vllm only, since vllm will replicate the image placeholder token by multi_modal_data.
                 prompt_ids = dedup_image_tokens(agent_data.prompt_ids, self.processor)
             else:
                 prompt_ids = agent_data.prompt_ids
@@ -202,7 +203,7 @@ class ToolAgentLoop(AgentLoopBase):
                     request_id=agent_data.request_id,
                     prompt_ids=prompt_ids,
                     sampling_params=sampling_params,
-                    image_data=agent_data.image_data,
+                    multi_modal_data=agent_data.multi_modal_data,
                 )
 
         agent_data.response_ids = agent_data.aborted_response_ids + output.token_ids
@@ -261,10 +262,10 @@ class ToolAgentLoop(AgentLoopBase):
 
             # Handle image data
             if tool_response.image:
-                if agent_data.image_data is None:
-                    agent_data.image_data = []
-                elif not isinstance(agent_data.image_data, list):
-                    agent_data.image_data = [agent_data.image_data]
+                if agent_data.multi_modal_data is None or 'image' not in agent_data.multi_modal_data:
+                    agent_data.multi_modal_data = {'image': []}
+                elif not isinstance(agent_data.multi_modal_data['image'], list):
+                    agent_data.multi_modal_data['image'] = [agent_data.multi_modal_data['image']]
 
                 # Add new image data
                 if isinstance(tool_response.image, list):
@@ -284,6 +285,11 @@ class ToolAgentLoop(AgentLoopBase):
                 raise NotImplementedError(
                     "Multimedia type 'video' is not currently supported. Only 'image' is supported."
                 )
+
+            if tool_response.audio:
+                #TODO(yzx): handle audio data
+                raise NotImplementedError("Audio data is not currently supported.")
+
 
         # Process tool responses to token ids
         if self.processor is not None:
@@ -327,13 +333,13 @@ class ToolAgentLoop(AgentLoopBase):
         if len(agent_data.response_mask) + len(response_ids) >= self.max_response_length:
             return AgentState.TERMINATED
 
-        # Update prompt_ids, response_mask, image_data
+        # Update prompt_ids, response_mask, multi_modal_data
         for img in new_images_this_turn:
             #TODO: remove this check in the future
             if isinstance(img, dict):
-                agent_data.image_data.append(img['image'])
+                agent_data.multi_modal_data['image'].append(img['image'])
             else:
-                agent_data.image_data.append(img)
+                agent_data.multi_modal_data['image'].append(img)
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:

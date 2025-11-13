@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.rollout.rollout_manager import AgentLoopBase, SampleState, register, Sample
+from verl.experimental.rollout.utils import dedup_image_tokens
 from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)
@@ -34,7 +35,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         metrics = {}
         request_id = sample.request_id
         prompt_ids = sample.prompt_ids.copy()
-        image_data = sample.multi_modal_data.get("image", None) if sample.multi_modal_data else None
+        multi_modal_data = sample.multi_modal_data
 
         # for partial rollout
         if sample.response_ids:
@@ -44,8 +45,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
             assert sampling_params["max_tokens"] > 0, f"max_tokens is {sampling_params['max_tokens']}, {len(sample.response_ids)=}"
 
         with simple_timer("generate_sequences", metrics):
+            if multi_modal_data:
+                # NOTE: for vllm only, since vllm will replicate the image placeholder token by multi_modal_data.
+                prompt_ids = dedup_image_tokens(prompt_ids, self.processor)
             output = await self.server_manager.generate(
-                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
+                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, multi_modal_data=multi_modal_data
             )
 
         sample.response_ids += output.token_ids

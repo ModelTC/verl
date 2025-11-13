@@ -1,0 +1,15 @@
+{
+  "auto_map": {
+    "AutoProcessor": "processing_senseomni.SenseOmniProcessor",
+    "AutoImageProcessor": "processing_senseomni.InternVLImageProcessor"
+  },
+  "processor_class": "SenseOmniProcessor",
+  "image_size": 448,
+  "patch_size": 14,
+  "min_dynamic_patch": 1,
+  "max_dynamic_patch": 12,
+  "dynamic_image_size": true,
+  "use_thumbnail": true,
+  "downsample_ratio": 0.5
+}
+

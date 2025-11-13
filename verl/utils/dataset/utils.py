@@ -6,6 +6,7 @@ import re
 import json
 import math
 import copy
+import librosa
 from typing import Dict, List
 
 import numpy as np
@@ -46,6 +47,10 @@ ACTION_END_TOKEN = "<|action_end|>"
 PLUG_TOKEN = "<|plugin|>"
 INTERPRETER_TOKEN = "<|interpreter|>"
 PAD_TOKEN = "<|endoftext|>"
+AUDIO_START_TOKEN = '<audio>'
+AUDIO_END_TOKEN = '</audio>'
+AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
+
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -218,7 +223,7 @@ class TCSLoader(object):
         print(f"[TCSLoader] config_path: {conf_path}")
         self.client = AOSSClient(conf_path)
 
-    def __call__(self, fn, file_type="image", max_num_frames=-1, min_num_frames=4, sample="rand", clip=None):
+    def __call__(self, fn, file_type="image", max_num_frames=-1, min_num_frames=4, sample="rand", clip=None, sr=16000):
         """Load and process a file based on its type.
 
         Args:
@@ -272,6 +277,21 @@ class TCSLoader(object):
                 )
             return frames
         
+        elif file_type == 'audio':
+            try:
+                if fn.startswith("s3://"):
+                    audio_value_str = self.client.get(fn)
+                    if len(audio_value_str) < 1000:
+                        return None
+                    audio, _ = librosa.load(io.BytesIO(audio_value_str), sr=sr)
+                else:
+                    audio, _ = librosa.load(fn, sr=sr)
+                if audio is not None and len(audio) > 0:
+                    return audio
+            except Exception as e:
+                print(f"Error loading audio: {e}")
+                return None
+
         elif file_type == "jsonl":
             file = self.client.get(fn)
             data = [json.loads(line) for line in file.splitlines()]

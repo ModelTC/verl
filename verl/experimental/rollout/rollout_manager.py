@@ -63,14 +63,28 @@ def _process_samples_for_multimodal(multi_modal_data_batch, processor_path: str)
     for multi_modal_data in multi_modal_data_batch:
         if multi_modal_data is None:
             image_list = []
+            audio_list = []
         else:
             image_list = multi_modal_data.get("image", [])
+            audio_list = multi_modal_data.get("audio", [])
         image_list = [image_convert(image) for image in image_list]
         output = processor.image_processor(images=image_list)
         multi_modal_inputs = {
             'pixel_values': output['pixel_values_flat'],
             'image_flags': output['image_flags']
         }
+
+        if audio_list:
+            audio_inputs = processor._preprocess_audio([''], audio_list)[1]
+            audio_flags= torch.tensor([1] * len(audio_list), dtype=torch.long)
+            audio_ret = dict(
+                audio_values=audio_inputs['audio_values'],
+                audio_len_after_cnn=audio_inputs['audio_len_after_cnn'],
+                audio_token_num=audio_inputs['audio_token_num'],
+                audio_flags=audio_flags,
+            )
+            multi_modal_inputs = multi_modal_inputs | audio_ret
+
         results.append(multi_modal_inputs)
     return results
 
@@ -119,7 +133,7 @@ class AsyncLLMServerManager:
         *,
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
+        multi_modal_data: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -136,7 +150,7 @@ class AsyncLLMServerManager:
             request_id=request_id,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
-            image_data=image_data,
+            multi_modal_data=multi_modal_data,
         )
         return output
 
@@ -191,13 +205,19 @@ class Sample:
     uid: str = None
 
     @classmethod
-    def from_dataset(cls, data: dict[str, Any], config: DictConfig) -> "Sample":
+    def from_dataset(cls, data: dict[str, Any], config: DictConfig, tokenizer: AutoTokenizer) -> "Sample":
         index = data['index'][0]
-        prompt_ids = data['raw_prompt_ids'].astype(int).squeeze().tolist()
+        # prompt_ids = data['raw_prompt_ids'].astype(int).squeeze().tolist()
+        prompt_ids = data['input_ids'][0]
+        prompt_ids = prompt_ids[prompt_ids != tokenizer.pad_token_id]
         prompt_ids = prompt_ids[:config.data.max_prompt_length]
+        prompt_ids = prompt_ids.tolist()
         data_source = data['data_source'][0]
         reward_info = data['reward_model'][0]
         agent_name = data.get('agent_name', [None])[0] or config.actor_rollout_ref.rollout.agent.default_agent_loop
+
+        if 'multi_modal_data' in data:
+            multi_modal_data = data.get('multi_modal_data')[0]
 
         return cls(
             index=index,
@@ -207,6 +227,7 @@ class Sample:
             data_source=data_source,
             reward_info=reward_info,
             uid=str(uuid4().hex),
+            multi_modal_data=multi_modal_data,
         )
 
     @classmethod
@@ -701,7 +722,7 @@ class RolloutManager:
             self.iter_train_dataset = iter(self.train_dataloader)
             data = next(self.iter_train_dataset)
 
-        sample = Sample.from_dataset(data, self.config)
+        sample = Sample.from_dataset(data, self.config, self.tokenizer)
         samples = []
         for i in range(self.config.actor_rollout_ref.rollout.n):
             s = copy.deepcopy(sample)
