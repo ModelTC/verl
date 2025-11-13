@@ -358,10 +358,11 @@ class AsyncvLLMServer(AsyncServerBase):
         sampling_params = SamplingParams(**sampling_params)
 
         multi_modal_data_item = {}
-        if 'image' in multi_modal_data and len(multi_modal_data['image']) > 0:
-            multi_modal_data_item['image'] = [image_convert(image_item) for image_item in multi_modal_data['image']]
-        if 'audio' in multi_modal_data and len(multi_modal_data['audio']) > 0:
-            multi_modal_data_item['audio'] = multi_modal_data['audio']
+        if multi_modal_data is not None:
+            if 'image' in multi_modal_data and len(multi_modal_data['image']) > 0:
+                multi_modal_data_item['image'] = [image_convert(image_item) for image_item in multi_modal_data['image']]
+            if 'audio' in multi_modal_data and len(multi_modal_data['audio']) > 0:
+                multi_modal_data_item['audio'] = multi_modal_data['audio']
 
         if len(multi_modal_data_item.keys()) == 0:
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
