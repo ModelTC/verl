@@ -17,11 +17,11 @@ import json
 import time
 from typing import Any, Dict, List
 import random
-import json
+import urllib.request
 import os
 
 import re
-import aiohttp
+import uuid
 from functools import partial
 
 import torch
@@ -50,6 +50,61 @@ import copy
 
 def repeat_each(lst, n):
     return [x for x in lst for _ in range(n)]
+
+
+def convert_tool_content_from_openai_to_verl(
+    content: list, image_placeholder: str,
+    tool_response_tags: tuple = ("<tool_response>", "</tool_response>"),
+):
+    text_content = [
+        {
+            "type": "text",
+            "text": "\n".join(
+                [tool_response_tags[0]] +
+                [
+                    (
+                        image_placeholder
+                        if i["type"] == "image_url"
+                        else i["text"]
+                    ).strip()
+                    for i in content
+                ] +
+                [tool_response_tags[1]]
+            )
+        }
+    ]
+
+    image_content = [i for i in content if i["type"] == "image_url"]
+    if len(image_content) > 0:
+        assert len(image_content) == 1
+
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        url = image_content[0]["image_url"]["url"]
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers)
+        ) as s:
+            # ensure the image can be safely taken by the model
+            image = Image.open(s)
+            assert image.size[0] > 0, image.size[1] > 0
+            image = adaptive_resize_image(image, max_aspect_ratio=200)
+            assert image.size[0] > 0, image.size[1] > 0
+            with io.BytesIO() as f:
+                image.save(f, "PNG")
+                f.seek(0)
+                mime = Image.open(f).get_format_mimetype()
+                base64_data = base64.b64encode(f.getvalue())
+
+            image_content[0] = {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:{};base64,{}".format(
+                        mime, base64_data.decode("utf-8")),
+                    "w": image.size[0],
+                    "h": image.size[1],
+                },
+            }
+
+    return text_content + image_content
 
 
 class ToolChatCompletionScheduler(ChatCompletionScheduler):
@@ -91,6 +146,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         else:
             self.tools = []
         self.tool_map = {tool.name: tool for tool in self.tools}
+        self.instance_ids = {}
 
 
     def _message_to_token(self, message):
@@ -235,20 +291,23 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
 
         return content
 
-    async def tool_call_execute(self, tool_name, arguments):
-        instance_id = None
+    async def tool_call_execute(self, batch_index, tool_name, arguments):
         try:
             tool = self.tool_map[tool_name]
-            instance_id = await tool.create()
+            instance_id = self.instance_ids[batch_index]
             tool_response, _, _ = await tool.execute(instance_id, arguments)
-            content = [{"type": "text", "text": "<tool_response>\n" + tool_response.strip() + "\n</tool_response>"}]
+            if isinstance(tool_response, str):
+                content = [{"type": "text", "text": "<tool_response>\n" + tool_response.strip() + "\n</tool_response>"}]
+            elif isinstance(tool_response, list):
+                content = convert_tool_content_from_openai_to_verl(
+                    tool_response, self.image_tag)
+            else:
+                raise Exception("Unsupported tool response type")
+
             return content
         except Exception as e:
             print(f"Error when executing tool: {e}")
             return [{"type": "text", "text": f"<tool_response>\n[Error when executing tool: {e}]\n</tool_response>"}]
-        finally:
-            if instance_id:
-                await tool.release(instance_id)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
@@ -290,7 +349,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
         print(f"[ToolChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
 
         # 2. helper functions
-        async def _process_tool_call(cells, resp):
+        async def _process_tool_call(batch_index, cells, resp):
             # === 1. 提取并验证工具调用 ===
             
             # 1.1 必须且只能找到一个 tool_call 块
@@ -320,7 +379,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             if tool_name == 'python':
                 content = await self.python_code_interpreter(cells, tool_name, arguments)
             else:
-                content = await self.tool_call_execute(tool_name, arguments)
+                content = await self.tool_call_execute(batch_index, tool_name, arguments)
 
             # print(f"!!!! content: {content}")
 
@@ -369,7 +428,7 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
 
             # check if the response contains a tool call
             with simple_timer('tool_call', metrics):
-                tool_message = await _process_tool_call(cells, content)
+                tool_message = await _process_tool_call(batch_index, cells, content)
             if tool_message == None:
                 metrics['end_time'] = time.time()
                 return
@@ -432,6 +491,9 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
             new_kwargs['max_completion_tokens'] = single_response_length
             new_kwargs['max_tokens'] = single_response_length
 
+            instance_id = self.instance_ids[batch_index] = str(uuid.uuid4())
+            for tool in self.tools:
+                await tool.create(instance_id)
             tasks.append(
                 asyncio.create_task(
                     self.submit_chat_completions(
@@ -453,6 +515,11 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
                 )
             )
         await asyncio.gather(*tasks)
+        for batch_index in range(len(raw_prompts)):
+            instance_id = self.instance_ids.pop(batch_index)
+            for tool in self.tools:
+                await tool.release(instance_id)
+
         print(f"[{self.__class__.__name__}] generate_sequences done")
 
         post_start = time.time()
