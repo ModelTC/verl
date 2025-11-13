@@ -3,7 +3,7 @@ import torch
 import json
 from collections import defaultdict
 from verl.common import make_object_from_config
-from verl.utils.dataset.utils import IMG_CONTEXT_TOKEN, PAD_TOKEN, IMG_CONTEXT_TOKEN_QWEN
+from verl.utils.dataset.utils import AUDIO_CONTEXT_TOKEN, AUDIO_END_TOKEN, AUDIO_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN, IMG_START_TOKEN, PAD_TOKEN, IMG_CONTEXT_TOKEN_QWEN
 from verl.utils.reward_score.omni_reward import compute_score_fns
 from verl.workers.reward_manager import register
 from verl.utils.reward_score.utils import ErrCode
@@ -97,7 +97,7 @@ class OmniRewardManager:
                 self.compute_score,
                 data_item.non_tensor_batch['reward_model']['reward_fn'],
             )
-            user_question = self.tokenizer.decode(prompt_ids).split("|im_start|>user\n")[-1].split("|im_end|")[0]
+            user_question = self.tokenizer.decode(prompt_ids).split("|im_start|>user\n")[-1].split("|im_end|")[0].replace(IMG_CONTEXT_TOKEN_QWEN, "").replace(PAD_TOKEN, "").replace(IMG_CONTEXT_TOKEN, "").replace(AUDIO_CONTEXT_TOKEN, "").replace(IMG_START_TOKEN, "").replace(IMG_END_TOKEN, "").replace(AUDIO_START_TOKEN, "").replace(AUDIO_END_TOKEN, "")
             try:
                 score = reward_fn(
                     valid_response_str, 

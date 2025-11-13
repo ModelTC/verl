@@ -8,6 +8,7 @@ from .gui.diou import compute_score as gui_diou
 from .ocr.general_ocr import calculate_levenshtein, calculate_captcha_task1, calculate_levenshtein_multi_answers, calculate_levenshtein_w_value, calculate_levenshtein_ignore_capital
 from .llmjudge.llmjudge import compute_score as llm_judge
 from .grounding.point_counting import compute_score as grounding_point_counting
+from .mcq.exact_match import compute_score as exact_match
 
 import re
 
@@ -25,7 +26,8 @@ compute_score_fns = {
     'OCR_Levenshtein_ignore_capital': calculate_levenshtein_ignore_capital,
     'OCR_Levenshtein_w_value':calculate_levenshtein_w_value,
     'llm_judge': llm_judge,
-    "grounding_point_counting": grounding_point_counting
+    "grounding_point_counting": grounding_point_counting,
+    "exact_match": exact_match
 }
 
 # add think reward

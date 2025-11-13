@@ -346,7 +346,7 @@ class AsyncvLLMServer(AsyncServerBase):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         request_id: str,
-        image_data: Optional[list[Any]] = None,
+        multi_modal_data: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
@@ -357,11 +357,17 @@ class AsyncvLLMServer(AsyncServerBase):
             sampling_params["max_tokens"] = max_tokens
         sampling_params = SamplingParams(**sampling_params)
 
-        if image_data is not None and len(image_data) > 0:
-            image_data = [image_convert(image_item) for image_item in image_data]
-            prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data})
-        else:
+        multi_modal_data_item = {}
+        if 'image' in multi_modal_data and len(multi_modal_data['image']) > 0:
+            multi_modal_data_item['image'] = [image_convert(image_item) for image_item in multi_modal_data['image']]
+        if 'audio' in multi_modal_data and len(multi_modal_data['audio']) > 0:
+            multi_modal_data_item['audio'] = multi_modal_data['audio']
+
+        if len(multi_modal_data_item.keys()) == 0:
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+        else:
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data_item)
+
         generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
 
         # Get final response

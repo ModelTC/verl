@@ -610,7 +610,7 @@ class RayPPOTrainerV1:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, scores, gts, reward_extra_infos_dict, dump_path):
-        from verl.utils.dataset.utils import IMG_CONTEXT_TOKEN, PAD_TOKEN, IMG_CONTEXT_TOKEN_QWEN
+        from verl.utils.dataset.utils import IMG_CONTEXT_TOKEN, PAD_TOKEN, IMG_CONTEXT_TOKEN_QWEN, AUDIO_CONTEXT_TOKEN
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -630,7 +630,7 @@ class RayPPOTrainerV1:
 
         lines = []
         for i in range(n):
-            entry = {k: v[i].replace(IMG_CONTEXT_TOKEN, '').replace(PAD_TOKEN, '').replace(IMG_CONTEXT_TOKEN_QWEN, '') if isinstance(v[i], str) else v[i] for k, v in base_data.items()}
+            entry = {k: v[i].replace(AUDIO_CONTEXT_TOKEN, '').replace(IMG_CONTEXT_TOKEN, '').replace(PAD_TOKEN, '').replace(IMG_CONTEXT_TOKEN_QWEN, '') if isinstance(v[i], str) else v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
