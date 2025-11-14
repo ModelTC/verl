@@ -440,6 +440,16 @@ class ToolChatCompletionScheduler(ChatCompletionScheduler):
 
             response_length += len(tool_message['token_ids_for_train'])
             batch_conversations[batch_index].append(tool_message)
+            if response_length == self.max_response_length:
+                metrics['end_time'] = time.time()
+                return
+
+            # ensure the next turn not exceeding the total limit
+            current_kwargs["max_completion_tokens"] = \
+                current_kwargs["max_tokens"] = min(
+                    current_kwargs["max_tokens"],
+                    self.max_response_length - response_length
+                )
 
             # resubmit chat completions with code block output
             extra_headers = {"x-request-id": completions.id}
