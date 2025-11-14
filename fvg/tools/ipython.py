@@ -185,7 +185,9 @@ class InteractivePythonRepl(BaseTool):
         for i in expired:
             session = self.sessions.pop(i)
             session["input_queue"].put(("shutdown", None))
-            session["process"].join()
+            session["process"].join(4.0)
+            if session["process"].exitcode is None:
+                session["process"].kill()
 
     def check_memory(self, process: Process):
         if process.pid is not None:
