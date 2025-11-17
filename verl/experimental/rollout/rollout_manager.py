@@ -188,6 +188,8 @@ class Sample:
     user_turns: int = 0
     assistant_turns: int = 0
 
+    staleness: int = -1
+
     uid: str = None
 
     @classmethod
@@ -647,6 +649,7 @@ class RolloutManager:
         # LRU cache to map request_id to server
         self.ref_to_worker = LRUCache(maxsize=10000)
 
+        self.epoch = 0
         self._create_dataloader(train_dataset, val_dataset)
 
         self.local_path = copy_to_local(config.actor_rollout_ref.model.path)
@@ -654,6 +657,7 @@ class RolloutManager:
         self.processor = hf_processor(self.local_path, trust_remote_code=True)
 
         self.use_partial_rollout = self.config.actor_rollout_ref.rollout.partial_rollout.enable
+        self.staleness_threshold = self.config.actor_rollout_ref.rollout.partial_rollout.staleness_threshold
         self.continuous_dispatch = self.config.actor_rollout_ref.rollout.continuous_dispatch
 
         if self.config.actor_rollout_ref.rollout.sample_filter_fn:
@@ -700,6 +704,7 @@ class RolloutManager:
             print("reached end of train dataset, reset iterator")
             self.iter_train_dataset = iter(self.train_dataloader)
             data = next(self.iter_train_dataset)
+            self.epoch += 1
 
         sample = Sample.from_dataset(data, self.config)
         samples = []
@@ -767,6 +772,9 @@ class RolloutManager:
                     name=f"agent_loop_worker_{i}",
                 ).remote(self.config, self.async_llm_servers)
             )
+
+    def _staleness_filter(self, groups: list[list[Sample]]) -> list[list[Sample]]:
+        return [group for group in groups if all(sample.staleness <= self.staleness_threshold for sample in group)]
 
     def generate_sequences(self) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
@@ -843,8 +851,9 @@ class RolloutManager:
                 self.ref_to_worker.pop(ref, None)
 
             if self.use_partial_rollout:
-                self.data_buffer.extend(ready_groups)
-                self.data_buffer.extend(aborted_groups)
+                cache_groups = self._staleness_filter(ready_groups + aborted_groups)
+                self.data_buffer.extend(cache_groups)
+
         logger.info("RolloutManager: pending tasks completed, waiting for sleep...")
 
         if self.config.actor_rollout_ref.rollout.free_cache_engine:

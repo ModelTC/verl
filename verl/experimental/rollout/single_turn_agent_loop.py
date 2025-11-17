@@ -58,6 +58,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         sample.extra_fields["finish_reason"] = output.finish_reason
         sample.metrics = metrics
         sample.assistant_turns = 1
+        sample.staleness += 1
 
         if output.finish_reason == "abort":
             sample.state = SampleState.ABORTED

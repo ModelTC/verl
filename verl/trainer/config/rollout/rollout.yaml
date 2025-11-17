@@ -227,6 +227,7 @@ trace:
 
 partial_rollout:
   enable: False
+  staleness_threshold: 2
 
 continuous_dispatch: False
 

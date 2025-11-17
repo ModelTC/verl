@@ -1056,6 +1056,7 @@ class RayPPOTrainerV1:
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.async_rollout_manager.train_dataloader.state_dict()
+        dataloader_state_dict['epoch'] = self.async_rollout_manager.epoch
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
@@ -1118,6 +1119,7 @@ class RayPPOTrainerV1:
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+            self.async_rollout_manager.epoch = dataloader_state_dict.pop('epoch', 0)
             self.async_rollout_manager.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
@@ -1594,7 +1596,7 @@ class RayPPOTrainerV1:
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
+                        "training/epoch": self.async_rollout_manager.epoch,
                     }
                 )
                 # collect metrics
