@@ -148,6 +148,7 @@ class ToolAgentLoop(AgentLoopBase):
             "turn_scores": agent_data.turn_scores,
             "tool_rewards": agent_data.tool_rewards,
         }
+        sample.staleness += 1
         if state == AgentState.ABORTED:
             sample.state = SampleState.ABORTED
         elif state == AgentState.TERMINATED:
