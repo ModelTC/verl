@@ -103,6 +103,9 @@ megatron:
   # oc.select: default val for ref.megatron.use_mbridge
   use_mbridge: False
 
+  # model data type used to initialize the transformers model
+  dtype: bfloat16 # ["bfloat16", "float16"]
+
 # profile the actor model in `update_policy` 
 profile:
 

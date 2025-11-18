@@ -220,18 +220,34 @@ def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerC
     return transformer_config
 
 
-def init_megatron_optim_config(optim_config: dict) -> OptimizerConfig:
+def init_megatron_optim_config(optim_config: dict, fp16: bool = False) -> OptimizerConfig:
     optim_args = {
         "optimizer": optim_config.get("optimizer", "adam"),
         "lr": optim_config.get("lr"),
         "min_lr": optim_config.get("min_lr", None),
         "clip_grad": optim_config.get("clip_grad", 1.0),
         "weight_decay": optim_config.get("weight_decay", 0.01),
-        "bf16": True,
-        "params_dtype": torch.bfloat16,
         "use_distributed_optimizer": True,
     }
-
+    if fp16:
+        optim_args.update(
+            {
+                "bf16": False,
+                "fp16": True,
+                "params_dtype": torch.float16,
+                "initial_loss_scale": 32768,
+                "min_loss_scale": 1,
+                "use_precision_aware_optimizer": True,
+                "store_param_remainders": False,
+            }
+        )
+    else:  # bf16 mode
+        optim_args.update(
+            {
+                "bf16": True,
+                "params_dtype": torch.bfloat16,
+            }
+        )
     override_config = optim_config.get("override_optimizer_config", {})
     if override_config:
         for k, v in override_config.items():
@@ -1080,3 +1096,41 @@ def print_node_to_rank_mapping():
                 f"pp: {info['pp_rank']}/{info['pp_ws']} "
             )
         print("="*80)
+
+
+def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
+    from megatron.core.distributed import finalize_model_grads
+    from megatron.core.utils import get_model_config
+
+    try:
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
+    except ImportError:
+        megatron_FSDP = DDP
+
+    # register some callbacks for megatron training, following https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.0rc7/megatron/training/training.py#L2039-L2057
+    for one_model in model:
+        config = get_model_config(one_model)
+        config.grad_scale_func = optimizer.scale_loss
+        config.finalize_model_grads_func = finalize_model_grads
+
+        overlap_param_gather = optimizer.config.overlap_param_gather
+        overlap_grad_reduce = one_model.ddp_config.overlap_grad_reduce
+        align_grad_reduce = True  # default to True, seldom to be false
+        align_param_gather = one_model.ddp_config.align_param_gather
+
+        if isinstance(model[0], megatron_FSDP | DDP) and overlap_grad_reduce:
+            assert config.no_sync_func is None, (
+                "When overlap_grad_reduce is True, config.no_sync_func must be None; "
+                "a custom no_sync_func is not supported when overlapping grad-reduce"
+            )
+            config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+            if len(model) == 1:
+                config.no_sync_func = config.no_sync_func[0]
+            if align_grad_reduce:
+                config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+                if len(model) == 1:
+                    config.grad_sync_func = config.grad_sync_func[0]
+        if overlap_param_gather and align_param_gather:
+            config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
+            if len(model) == 1:
+                config.param_sync_func = config.param_sync_func[0]
