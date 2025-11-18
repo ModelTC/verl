@@ -912,7 +912,7 @@ class RolloutManager:
 
         pending_refs = []
         for i, data in enumerate(self.val_dataloader):
-            sample = Sample.from_dataset(data, self.config)
+            sample = Sample.from_dataset(data, self.config, self.tokenizer)
             samples = []
             for i in range(self.config.actor_rollout_ref.rollout.val_kwargs.n):
                 s = copy.deepcopy(sample)
