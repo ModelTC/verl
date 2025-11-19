@@ -191,16 +191,23 @@ class BaseModelMerger(ABC):
         )
 
     def get_transformers_auto_model_class(self):
-        if "ForTokenClassification" in self.model_config.architectures[0]:
-            return AutoModelForTokenClassification
-        elif "ForCausalLM" in self.model_config.architectures[0]:
-            return AutoModelForCausalLM
-        elif "ForConditionalGeneration" in self.model_config.architectures[0]:
-            return AutoModelForVision2Seq
-        else:
-            return AutoModel
+        # if "ForTokenClassification" in self.model_config.architectures[0]:
+        #     return AutoModelForTokenClassification
+        # elif "ForCausalLM" in self.model_config.architectures[0]:
+        #     return AutoModelForCausalLM
+        # elif "ForConditionalGeneration" in self.model_config.architectures[0]:
+        #     return AutoModelForVision2Seq
+        # else:
+        #     return AutoModel
 
-        raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
+        # raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
+
+        if type(self.model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            actor_module_class = AutoModelForVision2Seq
+        else:
+            actor_module_class = AutoModelForCausalLM
+
+        return actor_module_class
 
     def patch_model_generation_config(self, model):
         """

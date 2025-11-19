@@ -394,7 +394,7 @@ class SenseOmniProcessor(ProcessorMixin):
             audio_inputs = {}
 
             audio = np.zeros((48000,), dtype=np.float32) # NOTE: too long audio will be truncated
-            audio_process_values = self.processor.process_audio(audio)
+            audio_process_values = self.process_audio(audio)
             audio_values = [audio_process_values['input_features']]
             audio_len_after_cnn = [audio_process_values['audio_len_after_cnn']]
             audio_token_num = [audio_process_values['audio_token_num']]
