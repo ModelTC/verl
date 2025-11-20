@@ -44,6 +44,7 @@ from verl.utils.megatron_utils import (
     load_megatron_optimizer,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
+    register_megatron_training_hooks,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
@@ -203,6 +204,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 return self.bridge.get_model(
                     post_model_creation_callbacks=post_model_creation_callbacks,
                     wrap_with_ddp=wrap_with_ddp,
+                    fp16=self.tf_config.fp16,
+                    bf16=self.tf_config.bf16,
                     optimizer_config=override_ddp_config,
                 )
             else:
@@ -272,7 +275,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # TODO: add more optimizer args into config
         if self._is_actor:
-            optim_config_megatron = init_megatron_optim_config(optim_config)
+            optim_config_megatron = init_megatron_optim_config(optim_config, fp16=self.dtype == torch.float16)
             actor_optimizer = get_megatron_optimizer(model=actor_module, config=optim_config_megatron)
             actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
                 optimizer=actor_optimizer, config=optim_config
@@ -288,6 +291,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             actor_optimizer_scheduler = None
 
         log_gpu_memory_usage("After actor optimizer init", logger=logger)
+        
+        register_megatron_training_hooks(actor_module, actor_optimizer)
 
         return actor_module, actor_optimizer, actor_optimizer_scheduler, self.hf_config, optim_config
 
@@ -428,7 +433,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
         else:
             override_transformer_config = {}
-        self.param_dtype = torch.bfloat16
+        self.param_dtype = PrecisionType.to_dtype(self.config.actor.megatron.dtype)
         log_gpu_memory_usage("Before init actor model and optimizer", logger=logger)
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
         if self._is_actor or self._is_rollout:
@@ -877,12 +882,15 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
             print_model_size(critic_module[0])
 
         # TODO: add more optimizer args into config
-        optim_config_megatron = init_megatron_optim_config(optim_config)
+        optim_config_megatron = init_megatron_optim_config(optim_config, fp16=self.dtype == torch.float16)
         critic_optimizer = get_megatron_optimizer(model=critic_module, config=optim_config_megatron)
         critic_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
             optimizer=critic_optimizer, config=optim_config
         )
         get_torch_device().empty_cache()
+
+        register_megatron_training_hooks(critic_module, critic_optimizer)
+
         return critic_module, critic_optimizer, critic_optimizer_scheduler, self.hf_config, optim_config
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -900,7 +908,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         override_transformer_config = OmegaConf.to_container(
             OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
         )
-        self.param_dtype = torch.bfloat16
+        self.param_dtype = PrecisionType.to_dtype(self.config.actor.megatron.dtype)
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
         (
             self.critic_module,
@@ -1158,7 +1166,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
                 rm_tokenizer_local_path, trust_remote_code=self.config.model.get("trust_remote_code", False)
             )
 
-        self.param_dtype = torch.bfloat16
+        self.param_dtype = PrecisionType.to_dtype(self.config.actor.megatron.dtype)
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
 
         reward_model_module, reward_model_config = self._build_rm_model(
