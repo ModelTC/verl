@@ -69,9 +69,11 @@ class McoreEngineConfig(BaseConfig):
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
     use_mbridge: bool = False
     vision_tensor_model_parallel_size: Optional[int] = None
+    dtype: str = "bfloat16"  # ["bfloat16", "float16"]
 
     def __post_init__(self) -> None:
         """config validation logics go here"""
+        assert self.dtype in ["bfloat16", "float16"], f"dtype {self.dtype} not supported"
         if self.tensor_model_parallel_size == 1:
             warnings.warn("set sequence parallel to false as TP size is 1", stacklevel=2)
             self.sequence_parallel = False

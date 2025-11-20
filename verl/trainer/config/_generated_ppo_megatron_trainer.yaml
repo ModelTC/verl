@@ -84,6 +84,7 @@ actor_rollout_ref:
         recompute_method: null
         recompute_num_layers: null
       use_mbridge: false
+      dtype: bfloat16
     profile:
       use_profile: false
       profile_ranks: null
@@ -113,6 +114,7 @@ actor_rollout_ref:
       seed: ${oc.select:actor_rollout_ref.actor.megatron.seed,42}
       override_transformer_config: ${oc.select:actor_rollout_ref.actor.megatron.override_transformer_config,{}}
       use_mbridge: ${oc.select:actor_rollout_ref.actor.megatron.use_mbridge,False}
+      dtype: bfloat16
     profile:
       use_profile: false
       profile_ranks: null
@@ -360,6 +362,7 @@ critic:
     override_ddp_config: ${oc.select:actor_rollout_ref.actor.megatron.override_ddp_config,{}}
     override_transformer_config: ${oc.select:actor_rollout_ref.actor.megatron.override_transformer_config,{}}
     use_mbridge: ${oc.select:actor_rollout_ref.actor.megatron.use_mbridge,False}
+    dtype: bfloat16
   load_weight: true
   data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
 reward_model:
@@ -403,6 +406,7 @@ reward_model:
     seed: ${oc.select:actor_rollout_ref.actor.megatron.seed,42}
     override_transformer_config: ${oc.select:actor_rollout_ref.actor.megatron.override_transformer_config,{}}
     use_mbridge: ${oc.select:actor_rollout_ref.actor.megatron.use_mbridge,False}
+    dtype: bfloat16
   load_weight: true
 custom_reward_function:
   path: null
