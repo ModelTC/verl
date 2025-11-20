@@ -130,6 +130,7 @@ class ActorConfig(BaseConfig):
                 )
 
         valid_loss_agg_modes = [
+            "global-token-mean",
             "token-mean",
             "seq-mean-token-sum",
             "seq-mean-token-mean",
