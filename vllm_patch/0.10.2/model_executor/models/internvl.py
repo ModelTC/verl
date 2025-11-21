@@ -503,7 +503,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
         if modality.startswith("image"):
-            return IMAGE_TOKEN,
+            return IMAGE_TOKEN
         if modality.startswith("video"):
             return VIDEO_TOKEN
 
