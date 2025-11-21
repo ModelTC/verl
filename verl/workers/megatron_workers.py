@@ -234,6 +234,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self._is_actor or self._is_rollout:
             actor_module = make_model(wrap_with_ddp=True)
+            print(f"after actor module init, self.tf_config.fp8: {self.tf_config.fp8}")
             print(f"actor_module: {len(actor_module)}")
             if self.config.actor.load_weight:
                 if self.config.actor.megatron.use_dist_checkpointing:

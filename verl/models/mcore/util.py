@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import torch
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -36,6 +37,8 @@ def preprocess_packed_seqs(
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
     align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+
+    align_size = math.lcm(align_size, 16)
 
     pad_size = (align_size - seqlens_in_batch % align_size) % align_size
     seqlens_in_batch_padded = seqlens_in_batch + pad_size
