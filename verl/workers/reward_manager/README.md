@@ -53,6 +53,7 @@ The reward function to check if the think behavior of the model response follows
 
 The parameters:
 
+* `response_prefix`: Add a prefix to the answer to ensure the completeness of the multi-turn response structure, facilitating the extraction of the given pattern. `"<|im_start|>assistant\n"` by default.
 * `message_pattern`: The template to extract the message of roles, `r"<\|im_start\|>(?P<role>[^\n]+)\n(?P<content>.*?)<\|im_end\|>"` by default.
 * `think_pattern`: The template to extract the content of think behavior, `r"<think>(.+?)</think>"` by default.
 
@@ -64,6 +65,7 @@ The reward function is implemented based on the paper ["ToolRL: Reward is All To
 
 The parameters:
 
+* `response_prefix`: Add a prefix to the answer to ensure the completeness of the multi-turn response structure, facilitating the extraction of the given pattern. `"<|im_start|>assistant\n"` by default.
 * `extract_pattern`: The template to extract the assistant message, `r"<\|im_start\|>assistant\n(.*?)<\|im_end\|>"` by default.
 * `scale`: The scale of the reward score, 1.0 by default (-3.0 ~ 4.0).
 
@@ -75,6 +77,7 @@ The reward function to check if the tool calling of the model response follows t
 
 The parameters:
 
+* `response_prefix`: Add a prefix to the answer to ensure the completeness of the multi-turn response structure, facilitating the extraction of the given pattern. `"<|im_start|>assistant\n"` by default.
 * `message_pattern`: The template to extract the assistant message, `r"<\|im_start\|>assistant\n(.*?)<\|im_end\|>"` by default.
 * `tool_call_pattern`: The template to extract the tool call blocks in the message content, `r"<tool_call>(.*?)</tool_call>"` by default.
 * `tool_call_style`: The format to parse the content of tool call blocks, either `"jsonl"`(default) or `"json"`.

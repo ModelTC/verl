@@ -7,9 +7,11 @@ import verl.utils.reward_score.toolrl as deepscaler_toolrl
 class ToolRlReward:
     def __init__(
         self,
+        response_prefix: str = "<|im_start|>assistant\n",
         extract_pattern: str = r'<\|im_start\|>assistant\n(.*?)<\|im_end\|>',
         scale: float = 1.0,
     ):
+        self.response_prefix = response_prefix
         self.extract_pattern = extract_pattern
         self.scale = scale
 
@@ -19,7 +21,7 @@ class ToolRlReward:
             **kwargs
         }
         raw_result = deepscaler_toolrl.compute_score(
-            model_response, ground_truth, extra_info)
+            self.response_prefix + model_response, ground_truth, extra_info)
 
         result = {"score": self.scale * raw_result["score"]}
         return result
@@ -44,12 +46,14 @@ class ToolFormatReward:
 
     def __init__(
         self,
+        response_prefix: str = "<|im_start|>assistant\n",
         message_pattern: str = r"<\|im_start\|>assistant\n(.*?)<\|im_end\|>",
         tool_call_pattern: str = r"<tool_call>(.*?)</tool_call>",
         tool_call_style: str = "jsonl",
         func_name_score_ratio: float = 0.5,
         default_score: float = 0.5,
     ):
+        self.response_prefix = response_prefix
         self.message_pattern = re.compile(message_pattern, re.DOTALL)
         self.tool_call_pattern = re.compile(tool_call_pattern, re.DOTALL)
         self.tool_call_style = tool_call_style
@@ -59,7 +63,8 @@ class ToolFormatReward:
     def __call__(self, model_response: str, ground_truth: list, **kwargs):
         tool_calls = [
             ToolFormatReward.tool_call_parsers[self.tool_call_style](j)
-            for i in self.message_pattern.findall(model_response)
+            for i in self.message_pattern.findall(
+                self.response_prefix + model_response)
             for j in self.tool_call_pattern.findall(i)
         ]
         scores = []

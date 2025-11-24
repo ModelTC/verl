@@ -258,6 +258,12 @@ class RLHFJSONDataset(RLHFDataset):
                 d['input_template'] = dataset_info['input_template']
 
                 if (
+                    'agent_name' in dataset_info and
+                    'agent_name' not in d
+                ):
+                    d['agent_name'] = dataset_info['agent_name']
+
+                if (
                     'reward_fn' in dataset_info and
                     'reward_fn' not in d['reward_model']
                 ):
