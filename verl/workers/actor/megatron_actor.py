@@ -679,14 +679,14 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
-            data = {"actor/grad_norm": grad_norm}
+            data = {"actor/grad_norm": grad_norm if grad_norm is not None else float("nan")}
             append_to_dict(metrics, data)
 
             if update_successful:
                 # allgather already execute in optimizer.step in new megatron
                 pass
             else:
-                raise NotImplementedError
+                self.actor_optimizer.zero_grad()
             self.prof.step()
         # add empty cache after each compute
         self.prof.stop_and_save()
