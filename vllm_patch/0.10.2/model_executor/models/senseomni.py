@@ -513,15 +513,19 @@ class SenseOmniForConditionalGeneration(nn.Module, SupportsPP,
             audio_values)  # (1, 1, 128, 3000) -> (1, 750, 1280)
 
         audio_embeds = self.mlp2(last_hidden_state)  # (1,750,2560)
-        audio_embeds = audio_embeds.flatten(
-            0, 1)  # merge the first two dimensions
-        audio_token_num = audio_token_num.reshape(-1)
-        pad_token_num = audio_embeds.shape[0] - audio_token_num.sum()
-        audio_embeds = audio_embeds.split(
-            audio_token_num.tolist() + [pad_token_num])[:len(audio_token_num)]
 
+        # audio_embeds = audio_embeds.flatten(
+        #     0, 1)  # merge the first two dimensions
+        # audio_token_num = audio_token_num.reshape(-1)
+        # pad_token_num = audio_embeds.shape[0] - audio_token_num.sum()
+        # audio_embeds = audio_embeds.split(
+        #     audio_token_num.tolist() + [pad_token_num])[:len(audio_token_num)]
 
-        # audio_features.split(audio_token_num.tolist())
+        audio_embeds_list = []
+        for i in range(audio_embeds.shape[0]):
+            audio_embeds_list.append(audio_embeds[i, :audio_token_num[i].item(), :])
+        audio_embeds = tuple(audio_embeds_list)
+
         return audio_embeds
 
     def pixel_shuffle(self, x, scale_factor=0.5):
