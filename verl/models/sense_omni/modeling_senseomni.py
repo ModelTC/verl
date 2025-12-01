@@ -31,6 +31,7 @@ from .modeling_whisper import AudioWhisperModel
 from .conversation import get_conv_template
 from verl.utils.dataset.audio_processors import base64_to_numpy_audio
 from verl.utils.dataset.image_processors import base64_to_pil
+from verl.utils.ulysses import get_ulysses_sequence_parallel_group, gather_outputs_and_unpad, get_ulysses_sequence_parallel_rank, get_ulysses_sequence_parallel_world_size
 
 logger = logging.get_logger(__name__)
 
@@ -160,40 +161,94 @@ class SenseOmniModel(PreTrainedModel):
             cu_seqlens: Optional[torch.IntTensor] = None,
             loss_weight = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        def evenly_split(N, n):
+            q, r = divmod(N, n)
+            parts = [q + 1] * r + [q] * (n - r)
+            max_num = max(parts)
+            result = [0]
+            acc = 0
+            for p in parts:
+                acc += p
+                result.append(acc)
+            idx = []
+            for i, item in enumerate(parts):
+                for j in range(item):
+                    idx.append(j + i * max_num)
+            return result, max_num, idx
+        
+        def get_sp_balance_input(pixel_values, image_flags):
+            sp_size = get_ulysses_sequence_parallel_world_size()
+            sp_rank = get_ulysses_sequence_parallel_rank()
+            vit_batch_size = pixel_values.shape[0]
+            parts, max_num, idx = evenly_split(vit_batch_size, sp_size)
+            sp_pixel_values = pixel_values[parts[sp_rank]:parts[sp_rank + 1]]
+            if sp_pixel_values.shape[0] < max_num:
+                padding_size = max_num - sp_pixel_values.shape[0]
+                sp_pixel_values = torch.cat((sp_pixel_values, pixel_values[-padding_size:]), dim=0)
+            new_image_flags = torch.zeros(max_num * sp_size, device=pixel_values.device).long()
+            new_image_flags[idx] = image_flags
+            return sp_pixel_values, new_image_flags
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_flags = image_flags.squeeze(-1)
         input_embeds = self.language_model.get_input_embeddings()(input_ids).clone()
 
+        sp_size = get_ulysses_sequence_parallel_world_size()
+        if sp_size > 1:
+            pixel_values, image_flags = get_sp_balance_input(pixel_values, image_flags)
         vit_embeds = self.extract_feature(pixel_values)
+        if sp_size > 1:
+            vit_embeds = gather_outputs_and_unpad(vit_embeds, gather_dim=0)
         vit_embeds = vit_embeds[image_flags == 1]
         vit_batch_size = pixel_values.shape[0]
 
         B, N, C = input_embeds.shape
         input_embeds = input_embeds.reshape(B * N, C)
+        vit_embeds = vit_embeds.reshape(-1, C)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             print(f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
 
         input_ids = input_ids.reshape(B * N)
         selected = (input_ids == self.img_context_token_id)
+        if get_ulysses_sequence_parallel_group() is not None:
+            selected_num_list = gather_outputs_and_unpad(selected.sum().unsqueeze(0), gather_dim=0)
+        
+            sp_rank = get_ulysses_sequence_parallel_rank()
+            if sum(selected_num_list.tolist()) != vit_embeds.shape[0]:
+                print(f"[mismatch] selected_num_list: {selected_num_list}, vit_embeds.shape: {vit_embeds.shape}")
+                if sum(selected_num_list.tolist()) < vit_embeds.shape[0]:
+                    vit_embeds = vit_embeds[:sum(selected_num_list.tolist())]
+                else:
+                    vit_embeds = torch.cat([vit_embeds, vit_embeds[(vit_embeds.shape[0] - sum(selected_num_list.tolist())):].detach()], dim=0)
+            vit_embeds = torch.split(vit_embeds, selected_num_list.tolist(), dim=0)[sp_rank]
+
         # input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
         try:
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
+            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds
             ignore_flag = False
         except Exception as e:
-            vit_embeds = vit_embeds.reshape(-1, C)
             print(f'warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, '
                   f'vit_embeds.shape={vit_embeds.shape}')
             n_token = min(selected.sum(), vit_embeds.shape[0])
             input_embeds[:n_token] = input_embeds[:n_token] * 0.0 + vit_embeds[:n_token]
             ignore_flag = True
 
+        audio_len_after_cnn_max = int(torch.max(audio_len_after_cnn).item())
+        sp_audio_flags = torch.ones(audio_values.shape[0], device=audio_values.device).long()
+        if sp_size > 1:
+            audio_values, sp_audio_flags_new = get_sp_balance_input(audio_values, sp_audio_flags)
+            audio_len_after_cnn, _ = get_sp_balance_input(audio_len_after_cnn, sp_audio_flags)
+        audio_embeds = self.extract_audio_feature(audio_values, audio_len_after_cnn, audio_len_after_cnn_max)  # (audio_num, n_frame, C)
+        if sp_size > 1:
+            audio_embeds = gather_outputs_and_unpad(audio_embeds, gather_dim=0)
+        audio_embeds = audio_embeds[sp_audio_flags_new == 1]
+
         if torch.distributed.get_rank() == 0:
             audio_batch_size = audio_values.shape[0]
             print(f'audio batch size: {audio_batch_size}, audios per sample: {audio_batch_size / B}')
-
-        audio_embeds = self.extract_audio_feature(audio_values, audio_len_after_cnn)  # (audio_num, n_frame, C)
 
         # v1
         # output_audios = []
@@ -236,6 +291,18 @@ class SenseOmniModel(PreTrainedModel):
 
             # 将处理后的 audio 数据嵌入到 input_embeds
             audio_selected = (input_ids == self.audio_context_token_id)
+            if get_ulysses_sequence_parallel_group() is not None:
+                sp_rank = get_ulysses_sequence_parallel_rank()
+                audio_selected_num_list = gather_outputs_and_unpad(audio_selected.sum().unsqueeze(0), gather_dim=0)
+                if sum(audio_selected_num_list.tolist()) != output_audios.shape[0]:
+                    print(f"[mismatch] audio_selected_num_list: {audio_selected_num_list}, output_audios.shape: {output_audios.shape}")
+                    if sum(audio_selected_num_list.tolist()) < output_audios.shape[0]:
+                        output_audios = output_audios[:sum(audio_selected_num_list.tolist())]
+                    else:
+                        output_audios = torch.cat([output_audios, output_audios[(output_audios.shape[0] - sum(audio_selected_num_list.tolist())):].detach()], dim=0)
+                output_audios = torch.split(output_audios, audio_selected_num_list.tolist(), dim=0)[sp_rank]
+            
+
             input_embeds[audio_selected] = input_embeds[audio_selected] * 0.0 + output_audios
 
         input_embeds = input_embeds.reshape(B, N, C)
@@ -447,15 +514,18 @@ class SenseOmniModel(PreTrainedModel):
                         }
         return audio_input_dict
     
-    def extract_audio_feature(self, audio_values, audio_len_after_cnn):
+    def extract_audio_feature(self, audio_values, audio_len_after_cnn, audio_len_after_cnn_max=None):
 
         audio_values = audio_values.squeeze(1)
-        max_len_in_batch = int(torch.max(audio_len_after_cnn).item())
+        if audio_len_after_cnn_max is None:
+            max_len_in_batch = int(torch.max(audio_len_after_cnn).item())
+        else:
+            max_len_in_batch = audio_len_after_cnn_max
         padding_mask = torch.ones([audio_values.size(0), max_len_in_batch]).to(dtype=audio_values.dtype, device=audio_values.device)
         for index in range(len(audio_values)):
             padding_mask[index, :int(audio_len_after_cnn[index].item())] = 0
 
-        last_hidden_state = self.audio_model(audio_values, padding_mask, audio_len_after_cnn)  # (bs, max_token_num, 1280)
+        last_hidden_state = self.audio_model(audio_values, padding_mask, audio_len_after_cnn=None)  # (bs, max_token_num, 1280)
 
         audio_embeds = self.mlp2(last_hidden_state)
 
