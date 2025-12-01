@@ -799,6 +799,14 @@ class RolloutManager:
     def _staleness_filter(self, groups: list[list[Sample]]) -> list[list[Sample]]:
         return [group for group in groups if all(sample.staleness <= self.staleness_threshold for sample in group)]
 
+    def _dispatch_tasks(self, pending_refs):
+        num_tasks = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        for i in range(num_tasks):
+            worker = self.agent_loop_workers[i % len(self.agent_loop_workers)]
+            ref = worker.generate_sequences.remote(self._get_next_batch())
+            pending_refs.append(ref)
+            self.ref_to_worker[ref] = worker
+
     def generate_sequences(self) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 
@@ -819,14 +827,14 @@ class RolloutManager:
         ray.get([worker.set_running.remote() for worker in self.agent_loop_workers])
 
         # dispatch initial tasks
-        for i in range(self.config.data.get("gen_batch_size", self.config.data.train_batch_size)):
-            worker = self.agent_loop_workers[i % len(self.agent_loop_workers)]
-            ref = worker.generate_sequences.remote(self._get_next_batch())
-            pending_refs.append(ref)
-            self.ref_to_worker[ref] = worker
+        self._dispatch_tasks(pending_refs)
 
         # dispatch tasks continuously
         while len(outputs) < self.config.data.train_batch_size:
+            # dispatch tasks if no pending tasks, avoid deadlock
+            if len(pending_refs) == 0:
+                self._dispatch_tasks(pending_refs)
+
             print(f"len(outputs): {len(outputs)}, len(pending_refs): {len(pending_refs)}")
             ready_refs, pending_refs = ray.wait(pending_refs, num_returns=1, fetch_local=True)
 
@@ -877,6 +885,7 @@ class RolloutManager:
             if self.use_partial_rollout:
                 cache_groups = self._staleness_filter(ready_groups + aborted_groups)
                 self.data_buffer.extend(cache_groups)
+                logger.info(f"RolloutManager: data buffer size: {len(self.data_buffer)}")
 
         logger.info("RolloutManager: pending tasks completed, waiting for sleep...")
 
