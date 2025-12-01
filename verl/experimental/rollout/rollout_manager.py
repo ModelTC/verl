@@ -808,14 +808,15 @@ class RolloutManager:
         Returns:
             DataProto: Output batch.
         """
-        if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.wake_up()
-
-        ray.get([worker.set_running.remote() for worker in self.agent_loop_workers])
-
         outputs = []
         pending_refs = []
         timing = {}
+
+        if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            with simple_timer("agent_loop/wake_up", timing):
+                self.wake_up()
+
+        ray.get([worker.set_running.remote() for worker in self.agent_loop_workers])
 
         # dispatch initial tasks
         for i in range(self.config.data.get("gen_batch_size", self.config.data.train_batch_size)):
@@ -880,7 +881,8 @@ class RolloutManager:
         logger.info("RolloutManager: pending tasks completed, waiting for sleep...")
 
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.sleep()
+            with simple_timer("agent_loop/sleep", timing):
+                self.sleep()
 
         # flat samples
         samples = [sample for group in outputs for sample in group]

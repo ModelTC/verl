@@ -31,6 +31,9 @@ from omegaconf import DictConfig
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
 
+from torch import distributed as dist
+from tensordict import TensorDict
+
 PolicyLossFn = Callable[
     [
         torch.Tensor,  # old_log_prob
@@ -696,7 +699,25 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
-def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str):
+def compute_avg_token_per_dp(batch: TensorDict, dp_group=None):
+    if not isinstance(batch, list):
+        batch = [batch]
+    response_tokens = 0
+    for item in batch:
+        response_length = item['responses'].size(1)
+        attention_mask = item['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        response_tokens += response_mask.sum()
+
+    if dist.is_initialized():
+        avg_token_per_dp = torch.tensor([response_tokens], device='cuda')
+        dist.all_reduce(avg_token_per_dp, op=dist.ReduceOp.AVG, group=dp_group)
+        avg_token_per_dp = avg_token_per_dp.cpu().item()
+
+    return avg_token_per_dp
+
+
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str, avg_token_per_dp: int = None):
     """
     Aggregate the loss matrix into a scalar.
 
@@ -711,7 +732,10 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
-    if loss_agg_mode == "token-mean":
+    if loss_agg_mode == "global-token-mean":
+        assert avg_token_per_dp is not None
+        loss = verl_F.masked_sum(loss_mat, loss_mask) / float(avg_token_per_dp)
+    elif loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
@@ -741,6 +765,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    avg_token_per_dp: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -814,7 +839,7 @@ def compute_policy_loss_vanilla(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, avg_token_per_dp=avg_token_per_dp)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
@@ -828,6 +853,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    avg_token_per_dp: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.

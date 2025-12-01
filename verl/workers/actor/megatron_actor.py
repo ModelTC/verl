@@ -37,7 +37,7 @@ from omegaconf import OmegaConf
 from torch import nn
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, compute_avg_token_per_dp
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
@@ -406,6 +406,12 @@ class MegatronPPOActor(BasePPOActor):
 
         forward_backward_func = get_forward_backward_func()
 
+        if self.config.loss_agg_mode == "global-token-mean":
+            avg_token_per_dp = compute_avg_token_per_dp(mini_batch.batch, dp_group=mpu.get_data_parallel_group(with_context_parallel=True))
+            avg_token_per_dp /= float(n_micro_batch)
+        else:
+            avg_token_per_dp = None
+
         def loss_func(output, data, meta_info):
             # For memory efficiency
             # We move calculation of entropy to compute_log_probs, forward_only == True
@@ -459,6 +465,7 @@ class MegatronPPOActor(BasePPOActor):
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
+                    avg_token_per_dp=avg_token_per_dp,
                 )
 
                 stats.update(
@@ -469,14 +476,12 @@ class MegatronPPOActor(BasePPOActor):
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
                 )
-                if self.config.tis_imp_ratio_cap > 0:
-                    stats["actor/tis_imp_ratio_mean"] = tis_imp_ratio_mean.detach().item()
                 policy_loss = pg_loss
 
             if calculate_entropy:
                 entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
                 if not forward_only:
-                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, avg_token_per_dp=avg_token_per_dp)
                     entropy_coeff = meta_info["entropy_coeff"]
                     policy_loss = pg_loss - entropy_coeff * entropy_loss
 
@@ -492,7 +497,7 @@ class MegatronPPOActor(BasePPOActor):
                     ref_log_prob = data["ref_log_prob"]
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode, avg_token_per_dp=avg_token_per_dp)
 
                     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                     metrics["actor/kl_loss"] = kl_loss.detach().item()
@@ -674,14 +679,14 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
-            data = {"actor/grad_norm": grad_norm}
+            data = {"actor/grad_norm": grad_norm if grad_norm is not None else float("nan")}
             append_to_dict(metrics, data)
 
             if update_successful:
                 # allgather already execute in optimizer.step in new megatron
                 pass
             else:
-                raise NotImplementedError
+                self.actor_optimizer.zero_grad()
             self.prof.step()
         # add empty cache after each compute
         self.prof.stop_and_save()
