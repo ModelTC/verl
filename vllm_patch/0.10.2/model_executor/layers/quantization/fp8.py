@@ -60,6 +60,14 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = init_logger(__name__)
 
+try:
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        RoutedExpertsCapturer
+    )
+    has_routed_experts_capturer = True
+except Exception as e:
+    logger.warning(f"Failed to capture routed experts: {e}")
+    has_routed_experts_capturer = False
 
 def _is_col_major(x: torch.Tensor) -> bool:
     assert x.dim() == 3
@@ -1099,6 +1107,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count,
         )
+
+        if has_routed_experts_capturer:
+            if RoutedExpertsCapturer.get_instance() is not None:
+                RoutedExpertsCapturer.get_instance().capture(
+                    layer_id=layer.get_layer_id,
+                    topk_ids=topk_ids,
+                )
 
         if self.rocm_aiter_moe_enabled:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa: E501
