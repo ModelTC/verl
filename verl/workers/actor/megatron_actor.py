@@ -48,6 +48,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
+from verl.utils.routing_replay import RoutingReplay
 
 __all__ = ["MegatronPPOActor"]
 
@@ -321,11 +322,15 @@ class MegatronPPOActor(BasePPOActor):
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        select_keys_non_tensor = []
+        if "route_top_indices" in data.non_tensor_batch:
+            select_keys_non_tensor.append("route_top_indices")
         if self.has_multi_modal_inputs:
             if "multi_modal_data" in data.non_tensor_batch.keys():
-                data = data.select(select_keys, ["multi_modal_inputs", "multi_modal_data"])
+                select_keys_non_tensor.extend(["multi_modal_inputs", "multi_modal_data"])
             else:
-                data = data.select(select_keys, ["multi_modal_inputs"])
+                select_keys_non_tensor.append("multi_modal_inputs")
+            data = data.select(select_keys, select_keys_non_tensor)
         else:
             data = data.select(batch_keys=select_keys)
         return data.make_iterator(
@@ -334,6 +339,7 @@ class MegatronPPOActor(BasePPOActor):
             seed=self.config.data_loader_seed,
             dataloader_kwargs={"shuffle": self.config.shuffle},
         )
+            
 
     def forward_backward_batch(
         self,
@@ -511,6 +517,11 @@ class MegatronPPOActor(BasePPOActor):
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
             batch = batch.to(get_device_id())
+            
+            if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+                old_stage = os.environ["ROUTING_REPLAY_STAGE"]
+                if old_stage == "replay_backward":
+                    os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
@@ -595,8 +606,16 @@ class MegatronPPOActor(BasePPOActor):
                     "entropy_coeff": self.config.entropy_coeff,
                     "clip_ratio_c": clip_ratio_c,
                 }
+            if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+                os.environ["ROUTING_REPLAY_STAGE"] = old_stage
             return output, partial(loss_func, data=batch, meta_info=meta_info)
-
+        
+        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1" and (os.environ["ROUTING_REPLAY_STAGE"] == "replay_forward" or os.environ["ROUTING_REPLAY_STAGE"] == "replay_backward"):
+            # for balanced_data
+            RoutingReplay.clear_all()
+            # preprocess router indices
+            from verl.utils.routing_replay import fill_routing_replay
+            fill_routing_replay(micro_batches, mini_batch.non_tensor_batch, n_micro_batch, indices, self.actor_module)
         # batch should be a list of batches inside micro-batches
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module), processor=self.processor)
 

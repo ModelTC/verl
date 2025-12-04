@@ -52,6 +52,8 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, multi_modal_data=multi_modal_data
             )
 
+        if output.route_top_indices is not None:
+            sample.route_top_indices = output.route_top_indices
         sample.response_ids += output.token_ids
         sample.response_mask += [1] * len(output.token_ids)
         if output.log_probs:

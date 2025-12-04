@@ -43,6 +43,7 @@ from verl.workers.rollout.async_server import TokenOutput
 
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
+import numpy as np
 
 logger = logging.getLogger(__file__)
 
@@ -378,6 +379,9 @@ class AsyncvLLMServer(AsyncServerBase):
         assert final_res is not None
 
         token_ids = final_res.outputs[0].token_ids
+        route_top_indices = None
+        if final_res.outputs[0].routed_experts is not None:
+            route_top_indices = final_res.outputs[0].routed_experts.astype(dtype=np.uint8)
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
@@ -385,7 +389,7 @@ class AsyncvLLMServer(AsyncServerBase):
         finish_reason = final_res.outputs[0].finish_reason
         assert finish_reason is not None
 
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs, finish_reason=finish_reason)
+        return TokenOutput(token_ids=token_ids, log_probs=log_probs, finish_reason=finish_reason, route_top_indices=route_top_indices)
 
     async def wake_up(self):
         if self.config.rollout.free_cache_engine:

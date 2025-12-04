@@ -182,6 +182,7 @@ class Sample:
     response_ids: list[int] = field(default_factory=list)
     response_mask: list[int] = field(default_factory=list)
     rollout_log_probs: Optional[list[float]] = None
+    route_top_indices: Optional[list[list[list[int]]]] = None
 
     multi_modal_data: Optional[dict[str, Any]] = None
     reward_score: Optional[float] = None
@@ -287,6 +288,8 @@ class Sample:
             "uid": np.array([sample.uid for sample in samples], dtype=object),
             "index": np.array([sample.index for sample in samples], dtype=object),
         }
+        if samples[0].route_top_indices is not None:
+            non_tensor_batch.update({"route_top_indices": np.array([sample.route_top_indices for sample in samples], dtype=object)})
 
         if any(sample.multi_modal_data is not None for sample in samples):
             # TODO: support internvl only for now

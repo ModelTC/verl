@@ -62,6 +62,8 @@ from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
 from verl.workers.vision_tp_utils import init_vision_tp 
 
+from verl.utils.routing_replay import RoutingReplay
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -172,6 +174,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "`log_prob_micro_batch_size` should not be None at the same time."
                 )
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
+            
+        self.use_routing_replay, self.use_rollout_routing_replay = False, False
+        self.routing_replay_mode = self.config.get("routing_replay_mode", "None")
+        if self.routing_replay_mode in ["R2", "R3"]:
+            self.use_routing_replay = True
+            os.environ["ENABLE_ROUTING_REPLAY"] = "1"
+            if self.routing_replay_mode == "R3":
+                self.use_rollout_routing_replay = True
 
 
     def _build_model_optimizer(self, model_path, optim_config, override_model_config, override_transformer_config):
@@ -500,6 +510,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self._ref_is_offload_param:
                 offload_megatron_model_to_cpu(self.ref_module)
                 log_gpu_memory_usage("After offload ref params during init", logger=logger)
+            if self.use_routing_replay:
+                RoutingReplay.clear_all_routing_replays()
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -547,6 +559,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["temperature"] = self.config.rollout.temperature
         dataloader = self.actor.make_minibatch_iterator(data=data)
+        if self.use_routing_replay:
+            os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+        
         with Timer(name="update_policy", logger=None) as timer:
             metrics.update(self.actor.update_policy(dataloader=dataloader))
         metrics["timing_s/update_policy"] = timer.last
@@ -570,12 +585,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 offload_megatron_optimizer(self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
         metrics["timing_s/offload_model"] = timer.last
-
+        
         aggressive_empty_cache(force_sync=True)
 
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
+        if self.use_routing_replay:
+            RoutingReplay.clear_all()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -629,6 +646,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data = data.to(get_device_id())
+        if self.use_routing_replay:
+            os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+        
         output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
@@ -652,12 +672,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data = data.to(get_device_id())
+        if self.use_routing_replay:
+            if self.use_rollout_routing_replay:
+                os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+            else:
+                os.environ["ROUTING_REPLAY_STAGE"] = "record"
+        
         output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
             tensors={"old_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},
         )
         output = output.to("cpu")
+        if self.use_rollout_routing_replay:
+            RoutingReplay.clear_all_forward()
         # clear kv cache
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)

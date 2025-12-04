@@ -34,8 +34,12 @@ from verl.workers.rollout.chat_scheduler import ChatCompletionScheduler
 
 logger = logging.getLogger(__file__)
 
+import numpy as np
+
 
 class TokenOutput(BaseModel):
+    model_config = {"arbitrary_types_allowed": True}
+    
     #NOTE: copy from from verl.workers.rollout.replica
     token_ids: list[int]
     """response token ids"""
@@ -43,6 +47,7 @@ class TokenOutput(BaseModel):
     """logprobs of response token ids"""
     finish_reason: Optional[str] = None
     """ finish_reason of response"""
+    route_top_indices: Optional[np.ndarray] = None
 
 
 def _get_free_port():
