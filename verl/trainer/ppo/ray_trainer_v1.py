@@ -62,6 +62,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.trainer.ppo.mismatch_helper import compute_rollout_importance_weights
+from verl.utils.routing_replay import pack_blosc_batch
 
 WorkerType = type[Worker]
 
@@ -1308,6 +1309,9 @@ class RayPPOTrainerV1:
                                 gen_batch_output.non_tensor_batch.pop("metrics")
                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
+                    if "route_top_indices" in gen_batch_output.non_tensor_batch:
+                        comp = pack_blosc_batch(gen_batch_output.non_tensor_batch.pop("route_top_indices"))
+                        gen_batch_output.non_tensor_batch["route_top_indices"] = np.array(comp, dtype=object)
 
 
                     # batch.non_tensor_batch["uid"] = np.array(
