@@ -380,7 +380,7 @@ class AsyncvLLMServer(AsyncServerBase):
 
         token_ids = final_res.outputs[0].token_ids
         route_top_indices = None
-        if final_res.outputs[0].routed_experts is not None:
+        if hasattr(final_res.outputs[0], "routed_experts") and final_res.outputs[0].routed_experts is not None:
             route_top_indices = final_res.outputs[0].routed_experts.astype(dtype=np.uint8)
         log_probs = None
         if sampling_params.logprobs is not None:
