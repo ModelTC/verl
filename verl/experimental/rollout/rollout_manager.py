@@ -965,7 +965,7 @@ class RolloutManager:
         timing["agent_loop/reward/mean"] = t_reward.mean()
 
         # batch sequence generation is bounded by the slowest sample
-        slowest = np.argmax(t_generate_sequences + t_tool_calls)
+        slowest = np.argmax(t_generate_sequences + t_tool_calls + t_reward)
         attention_mask = output.batch["attention_mask"][slowest]
         prompt_length = output.batch["prompts"].shape[1]
         timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
@@ -987,3 +987,9 @@ class RolloutManager:
     def abort(self):
         """Abort all rollout server instances."""
         ray.get([server.abort.remote() for server in self.async_llm_servers])
+
+    def load_dataloader_state(self, dataloader_state_dict):
+        """Load dataloader state from checkpoint"""
+        self.epoch = dataloader_state_dict.pop('epoch', 0)
+        self.train_dataloader.load_state_dict(dataloader_state_dict)
+        self.iter_train_dataset = iter(self.train_dataloader)
