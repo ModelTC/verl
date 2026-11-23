@@ -126,6 +126,11 @@ class PPOTrainer(ABC):
     """
 
     def __init__(self, config: DictConfig):
+        from verl.experimental.teacher_loop.shared_config import is_shared_opd_enabled, prepare_config
+
+        self.shared_opd_enabled = is_shared_opd_enabled(config)
+        if self.shared_opd_enabled:
+            prepare_config(config)
         self.config = config
         self.checkpoint_callback = build_checkpoint_callback(config)
         self.use_critic = need_critic(self.config)
@@ -367,7 +372,13 @@ class PPOTrainer(ABC):
         # 8. initialize teacher loop manager
         if self.use_teacher_policy:
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            self.teacher_model_manager = MultiTeacherModelManager(
+            teacher_manager_class = MultiTeacherModelManager
+            if self.shared_opd_enabled:
+                from verl.experimental.teacher_loop.shared_teacher import SharedTeacherModelManager
+
+                self.actor_rollout_wg.to("cpu", model=True, optimizer=True, grad=True)
+                teacher_manager_class = SharedTeacherModelManager
+            self.teacher_model_manager = teacher_manager_class(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
@@ -417,6 +428,8 @@ class PPOTrainer(ABC):
         Returns:
             dict[str, LLMServerClient]: The teacher server clients.
         """
+        if self.shared_opd_enabled:
+            return None
         return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
 
     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
@@ -629,6 +642,10 @@ class PPOTrainer(ABC):
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
+
+        if self.shared_opd_enabled:
+            with marked_timer("teacher", timing_raw):
+                metrics.update(self.teacher_model_manager.compute_batch(batch))
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -905,7 +922,9 @@ class PPOTrainer(ABC):
             self.mapping[Role.RewardModel] = "global_pool"
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if self.shared_opd_enabled:
+            self.mapping[Role.TeacherModel] = global_pool_id
+        elif is_distillation_enabled(distillation_config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:
@@ -915,7 +934,11 @@ class PPOTrainer(ABC):
             resource_pool_spec["teacher_pool"] = teacher_pool
             self.mapping[Role.TeacherModel] = "teacher_pool"
 
-        self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+        self.resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec,
+            mapping=self.mapping,
+            max_colocate_count=4 if self.shared_opd_enabled else 3,
+        )
 
     def _load_checkpoint(self):
         self.global_steps = 0

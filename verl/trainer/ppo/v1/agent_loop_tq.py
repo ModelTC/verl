@@ -165,14 +165,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
-        # TODO: Support output:list[AgentLoopOutput]
-        await self._compute_teacher_logprobs(
-            final_output,
-            prompt_ids=final_output.prompt_ids,
-            response_ids=final_output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
-        )
+        teacher_outputs = outputs if getattr(self, "shared_opd_enabled", False) else [final_output]
+        for trajectory_output in teacher_outputs:
+            await self._compute_teacher_logprobs(
+                trajectory_output,
+                prompt_ids=trajectory_output.prompt_ids,
+                response_ids=trajectory_output.response_ids,
+                validate=validate,
+                sample_kwargs=kwargs,
+            )
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:

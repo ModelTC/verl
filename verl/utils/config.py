@@ -131,6 +131,11 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    if OmegaConf.select(config, "shared_opd.enabled", default=False):
+        from verl.experimental.teacher_loop.shared_config import prepare_config
+
+        prepare_config(config)
+
     if config.data.get("custom_dataloader") is not None:
         if not config.trainer.get("use_v1", True):
             raise ValueError("data.custom_dataloader requires the V1 PPO trainer.")

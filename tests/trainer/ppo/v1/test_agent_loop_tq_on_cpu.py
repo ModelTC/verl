@@ -143,3 +143,17 @@ async def test_agent_loop_tq_postprocess_skips_rollout_topk_on_validate(monkeypa
 
     assert "rollout_topk_ids" not in fields.keys()
     assert "rollout_topk_log_probs" not in fields.keys()
+
+
+@pytest.mark.asyncio
+async def test_shared_opd_defers_every_trajectory_without_teacher_rpc(monkeypatch):
+    worker = _DummyWorker(topk_log_probs=0)
+    worker.distillation_enabled = True
+    worker.shared_opd_enabled = True
+    worker.teacher_key = "data_source"
+    outputs = [_output({}), _output({})]
+    fields = await _postprocess(monkeypatch, worker, outputs, validate=False)
+    assert "teacher_logprobs" not in fields
+    for extra in fields["extra_fields"]:
+        assert extra["teacher_request"]["routing_key"] is None
+    assert all("teacher_request" in output.extra_fields for output in outputs)

@@ -566,10 +566,12 @@ class AgentLoopWorker:
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
+        self.shared_opd_enabled = OmegaConf.select(config, "shared_opd.enabled", default=False)
         if self.distillation_enabled:
+            self.teacher_key = config.distillation.teacher_key
+        if self.distillation_enabled and not self.shared_opd_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
-            self.teacher_key: str = config.distillation.teacher_key
             self.teacher_server_manager = AsyncTeacherLLMServerManager(
                 config=config,
                 teacher_client=teacher_client,
@@ -1132,6 +1134,14 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            if getattr(self, "shared_opd_enabled", False):
+                output.extra_fields["teacher_request"] = {
+                    "routing_key": routing_key,
+                    "multi_modal_data": output.multi_modal_data or {},
+                    "mm_processor_kwargs": output.mm_processor_kwargs or {},
+                    "mm_processor_output": output.mm_processor_output,
+                }
+                return
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,

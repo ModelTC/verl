@@ -527,3 +527,15 @@ ray_kwargs:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+
+# Time-share the actor GPU pool with distillation teachers in the sync or colocate_async V1 trainer.
+shared_opd:
+
+  # Enable deferred teacher scoring between rollout and actor update.
+  enabled: false
+
+  # Run each teacher in a separate inference engine.
+  teacher_execution: separate_engine
+
+  # Limit concurrent requests per teacher.
+  max_concurrent_requests: 32

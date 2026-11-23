@@ -44,6 +44,7 @@ class TeacherModelManager:
         distillation_config: DistillationConfig,
         teacher_model_config: DistillationTeacherModelConfig,
         resource_pool: RayResourcePool,
+        defer_server_initialization: bool = False,
     ):
         """
         Initialize the teacher model manager.
@@ -58,10 +59,12 @@ class TeacherModelManager:
         self.distillation_config = distillation_config
         self.teacher_model_config = teacher_model_config
         self.resource_pool = resource_pool
-        self._initialize_llm_servers()
-        self._initialize_load_balancer_handle()
+        self._prepare_llm_servers()
+        if not defer_server_initialization:
+            _run_all([self._launch_llm_servers()])
+            self._initialize_load_balancer_handle()
 
-    def _initialize_llm_servers(self):
+    def _prepare_llm_servers(self):
         teacher_model_config = self.teacher_model_config
         per_replica_world_size = teacher_model_config.per_replica_world_size
         num_replicas = teacher_model_config.num_replicas
@@ -102,10 +105,14 @@ class TeacherModelManager:
         split_resource_pools = split_resource_pool(self.resource_pool, split_size=per_replica_world_size)
         assert len(split_resource_pools) == len(self.rollout_replicas)
         self._validate_replica_node_alignment(split_resource_pools, per_replica_world_size, gpus_per_node)
-        _run_all(
-            [
+        self._replica_resource_pools = split_resource_pools
+
+    async def _launch_llm_servers(self):
+        rollout_config = self.teacher_model_config.inference
+        await asyncio.gather(
+            *[
                 server.init_colocated(resource_pool)
-                for server, resource_pool in zip(self.rollout_replicas, split_resource_pools, strict=True)
+                for server, resource_pool in zip(self.rollout_replicas, self._replica_resource_pools, strict=True)
             ]
         )
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
@@ -201,7 +208,7 @@ class MultiTeacherModelManager:
 
         self._initialize_teacher_model_managers()
 
-    def _initialize_teacher_model_managers(self):
+    def _initialize_teacher_model_managers(self, parallel_launch=False):
         teacher_models = self.distillation_config.teacher_models
         split_sizes = [teacher.world_size for teacher in teacher_models.values()]
         split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
@@ -211,8 +218,15 @@ class MultiTeacherModelManager:
                 distillation_config=self.distillation_config,
                 teacher_model_config=teacher_model_config,
                 resource_pool=teacher_pool,
+                defer_server_initialization=parallel_launch,
             )
             self.teacher_model_managers[key] = manager
+
+        if parallel_launch:
+            _run_all([manager._launch_llm_servers() for manager in self.teacher_model_managers.values()])
+        for key, manager in self.teacher_model_managers.items():
+            if parallel_launch:
+                manager._initialize_load_balancer_handle()
             self.server_addresses[key] = manager.server_addresses
             self.server_handles[key] = manager.server_handles
             self.load_balancer_handle[key] = manager.load_balancer_handle

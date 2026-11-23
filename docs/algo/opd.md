@@ -2,7 +2,7 @@
 
 **Author:** [Jacob Helwig](https://jacobhelwig.github.io/)
 
-Last updated: 10/03/2026.
+Last updated: 11/19/2026.
 
 ## Background
 
@@ -181,7 +181,8 @@ Number of GPUs per node in the teacher resource pool. Default: `8`.
 ### `distillation.nnodes` (int)
 
 Number of nodes in the teacher resource pool. Default: `0` (effectively
-disables the pool — must be set to `≥ 1` when `enabled=True`).
+disables the dedicated pool). Set this to at least 1 for a dedicated pool.
+In shared mode, the trainer supplies both teacher pool dimensions from its own GPU topology.
 
 **Constraint:** the total teacher pool size (`n_gpus_per_node × nnodes`) must
 exactly equal the sum of `(num_replicas × per_replica_world_size)` across all
@@ -407,6 +408,45 @@ actor_rollout_ref:
 algorithm:
    use_kl_in_reward: false
 ```
+
+### Shared-GPU OPD
+
+The Qwen3.5-9B example runs an FSDP student and a vLLM teacher on the same
+eight GPUs. It uses the `k1` sampled-token distillation loss with policy
+gradients. The same teacher scores both GSM8K and MATH trajectories.
+[Example script](../../examples/on_policy_distillation_trainer/run_qwen3_5_9B_share_opd_fsdp.sh)
+
+```bash
+bash examples/on_policy_distillation_trainer/run_qwen3_5_9B_share_opd_fsdp.sh
+```
+
+The script enables `SHARED_OPD_ENABLED=true` by default. Set `STUDENT_MODEL`
+and `TEACHER_MODEL` to select different checkpoints. The teacher pool takes
+its size from `NNODES` and `NGPUS_PER_NODE`. With one eight-GPU node and
+`TEACHER_TP=2`, the trainer starts four teacher replicas of two GPUs each.
+
+During student rollout, each training trajectory records a teacher request.
+Once the student replicas sleep, the V1 trainer groups the sampled batch’s requests
+by teacher, wakes each teacher with work, and sends each trajectory to one of
+its replicas. `SHARED_OPD_MAX_CONCURRENT_REQUESTS` defaults to 32 across all
+replicas of each teacher. The teachers sleep before the actor update.
+
+Shared scheduling requires actor parameter and optimizer offload, sleep mode
+for both student and teacher inference, the naive checkpoint engine, and
+training without a critic. GPU reward models require a separate pool.
+
+To enable partial rollout, pass the V1 trainer mode to the same example script.
+
+```bash
+bash examples/on_policy_distillation_trainer/run_qwen3_5_9B_share_opd_fsdp.sh \
+  trainer.v1.trainer_mode=colocate_async
+```
+
+Once a training batch is ready, the trainer pauses unfinished student requests
+and puts the student replicas to sleep. The independent teacher replicas score
+the sampled batch and go back to sleep. After the actor update and student weight
+sync, each interrupted request continues from its generated tokens with its
+remaining response budget.
 
 ### GKD OPD
 
